@@ -1,0 +1,7 @@
+.vscode/*
+
+# Node test dependencies
+node_modules/
+
+# Local deployment backups
+backup/

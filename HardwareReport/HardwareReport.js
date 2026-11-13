@@ -1,34 +1,98 @@
 
+let import_done = []
 var DataflashParser
-import('../JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default });
+import_done[0] = import('../modules/JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default })
 
+// This is the one package we do get from a CDN.
+// If we are offline the GitHub API will not work, so there is no need for a local copy for offline use.
+// Catch the error for the offline case, the version request will report that it failed because its offline.
 var octokitRequest
-import('https://esm.sh/@octokit/request').then((mod) => { octokitRequest = mod.request });
+import_done[1] = import('https://esm.sh/@octokit/request')
+    .then((mod) => { octokitRequest = mod.request })
+    .catch(error => console.log(error))
 
+// Make sure whole page is loaded
+import_done[2] = new Promise((resolve) => {
+    window.addEventListener('load', () => {
+        initial_load().then(() => {
+            load()
+            resolve()
+        })
+    })
+})
+
+function configurePlotlyCanvas() {
+  const originalGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function(contextType, contextAttributes) {
+    if (contextType === '2d') {
+      contextAttributes = contextAttributes || {};
+      contextAttributes.willReadFrequently = true;
+    }
+    return originalGetContext.call(this, contextType, contextAttributes);
+  };
+}
+configurePlotlyCanvas()
+
+
+let ArduPilot_GitHub_tags
+let octokitRequest_ratelimit_reset
 async function check_release(hash, paragraph) {
     paragraph.appendChild(document.createElement("br"))
 
-    let request
-    try {
-        // Get all tags from AP repo
-        request = await octokitRequest('GET /repos/:owner/:repo/git/refs/tags', {
-            owner: 'ArduPilot',
-            repo: 'ardupilot',
-            headers: {
-            'X-GitHub-Api-Version': '2022-11-28'
-            }
-        })
-    }
-    catch(err) {
-        paragraph.appendChild(document.createTextNode("Version check failed to get whitelist"))
+    if (octokitRequest == null) {
+        paragraph.appendChild(document.createTextNode("Version check failed, offline (" + hash + ")"))
         return
     }
 
-    const tags = request.data
+    function log_rate_reset(now) {
+        const wait = octokitRequest_ratelimit_reset - now
+        const wait_m = Math.floor(wait / 60)
+        const wait_s = Math.floor(wait % 60)
+        console.log("GitHub API rate limit exceeded, try again in " + wait_m + "m " + wait_s + "s" )
+    }
+
+    if (octokitRequest_ratelimit_reset) {
+        const now = Date.now() / 1000
+        if (now < octokitRequest_ratelimit_reset) {
+            log_rate_reset(now)
+            return
+        }
+        octokitRequest_ratelimit_reset = null
+    }
+
+    function api_error(err) {
+        if ((err.status == 403) || (err.status == 429)) {
+            octokitRequest_ratelimit_reset = parseInt(err.response.headers["x-ratelimit-reset"])
+            log_rate_reset(Date.now() / 1000)
+            return
+        }
+
+        console.log(err)
+    }
+
+    if (ArduPilot_GitHub_tags == null) {
+        let request
+        try {
+            // Get all tags from AP repo
+            request = await octokitRequest('GET /repos/:owner/:repo/git/refs/tags', {
+                owner: 'ArduPilot',
+                repo: 'ardupilot',
+                headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+                }
+            })
+        }
+        catch(err) {
+            paragraph.appendChild(document.createTextNode("Version check failed to get whitelist (" + hash + ")"))
+            api_error(err)
+            return
+        }
+        ArduPilot_GitHub_tags = request.data
+    }
 
     // Search tags for matching hash
     let found_tag = false
-    for (tag of tags) {
+    for (let tag of ArduPilot_GitHub_tags) {
         if (tag.object.sha.startsWith(hash)) {
             // Add link to tag
             if (found_tag) {
@@ -55,10 +119,11 @@ async function check_release(hash, paragraph) {
     }
 
     // Note that dev builds from master don't have tags, so will get this warning
-    paragraph.appendChild(document.createTextNode("Warning: not official firmware release"))
+    paragraph.appendChild(document.createTextNode("Warning: not official firmware release."))
     paragraph.appendChild(document.createElement("br"))
 
     // Try and find hash in AP repo, this should find dev builds
+    let request
     try {
         request = await octokitRequest('GET /repos/:owner/:repo/commits/' + hash, {
             owner: 'ArduPilot',
@@ -69,7 +134,8 @@ async function check_release(hash, paragraph) {
         })
     }
     catch(err) {
-        paragraph.appendChild(document.createTextNode("Version check failed to get commit"))
+        paragraph.appendChild(document.createTextNode("Version check failed to get commit (" + hash + ")"))
+        api_error(err)
         return
     }
 
@@ -79,10 +145,8 @@ async function check_release(hash, paragraph) {
 
     let link = document.createElement("a")
     link.href = request.data.html_url
-    link.innerHTML = sha
+    link.innerHTML = hash
     paragraph.appendChild(link)
-
-    paragraph.appendChild(document.createElement("br"))
 
     // Branches with this commit as head
     try {
@@ -96,16 +160,19 @@ async function check_release(hash, paragraph) {
           })
     }
     catch(err) {
-        paragraph.appendChild(document.createTextNode("Version check failed to get branches"))
+        paragraph.appendChild(document.createElement("br"))
+        paragraph.appendChild(document.createTextNode("Version check failed to get branches."))
+        api_error(err)
         return
     }
 
 
     if (request.data.length > 0) {
+        paragraph.appendChild(document.createElement("br"))
         paragraph.appendChild(document.createTextNode("Branches @ HEAD: "))
 
         let found_branch = false
-        for (branch of request.data) {
+        for (let branch of request.data) {
             if (found_branch) {
                 paragraph.appendChild(document.createTextNode(", "))
             }
@@ -126,10 +193,31 @@ async function check_release(hash, paragraph) {
 
 }
 
-function show_watchdog(WDOG) {
+function show_watchdog(log) {
+
+    if (!('WDOG' in log.messageTypes)) {
+        return
+    }
+
+    const WDOG = log.get("WDOG")
+
+    // The dev-team want to hear about watchdogs dumps.
+    const content = document.createElement("div")
+    content.appendChild(document.createTextNode("Watchdog reboot detected, see Watchdog section."))
+    content.appendChild(document.createElement("br"))
+    content.appendChild(document.createTextNode("For more information see ArduPilot "))
+
+    const link = document.createElement("a")
+    link.href = "https://ardupilot.org/copter/docs/common-watchdog.html#independent-watchdog-and-crash-dump"
+    link.appendChild(document.createTextNode("documentation"))
+
+    content.appendChild(link)
+    content.appendChild(document.createTextNode("."))
+
+    add_warning("exclamation-triangle-red", content)
 
     let watchdogs = []
-    for (let i = 0; i < WDOG.time_boot_ms.length; i++) {
+    for (let i = 0; i < WDOG.TimeUS.length; i++) {
         let watchdog = { 
             scheduler_task: WDOG.Tsk[i],
             internal_errors: WDOG.IE[i],
@@ -451,31 +539,39 @@ function show_internal_errors(log) {
     let internal_errors = []
 
     // Add from PM
-    if (('PM' in log.messages) &&
-        ("time_boot_ms" in log.messages.PM) &&
-        ("IntE" in log.messages.PM) &&
-        ("ErrL" in log.messages.PM) &&
-        ("ErrC" in log.messages.PM)) {
-        const len = log.messages.PM.time_boot_ms.length
-        for (let i = 0; i < len; i++) {
-            internal_errors.push({
-                time: log.messages.PM.time_boot_ms[i],
-                mask: log.messages.PM.IntE[i],
-                line: log.messages.PM.ErrL[i],
-                count: log.messages.PM.ErrC[i]
-            })
+    if ('PM' in log.messageTypes) {
+        const errorField = 
+            log.messageTypes.PM.expressions.includes("IntE") ? "IntE" :
+            log.messageTypes.PM.expressions.includes("InE") ? "InE" : undefined
+
+        const errorCount = 
+            log.messageTypes.PM.expressions.includes("ErrC") ? "ErrC" :
+            log.messageTypes.PM.expressions.includes("ErC") ? "ErC" : undefined
+
+        if (log.messageTypes.PM.expressions.includes("ErrL") && (errorField != undefined) && (errorCount != undefined)) {
+            const PM = log.get("PM")
+            const len = PM.TimeUS.length
+            for (let i = 0; i < len; i++) {
+                internal_errors.push({
+                    time: PM.TimeUS[i],
+                    mask: PM[errorField][i],
+                    line: PM.ErrL[i],
+                    count: PM[errorCount][i]
+                })
+            }
         }
     }
 
     // Add from MON
-    if (('MON' in log.messages) && (Object.keys(log.messages.MON).length > 0)) {
-        const len = log.messages.MON.time_boot_ms.length
+    if ('MON' in log.messageTypes) {
+        const MON = log.get("MON")
+        const len = MON.TimeUS.length
         for (let i = 0; i < len; i++) {
             internal_errors.push({
-                time: log.messages.MON.time_boot_ms[i],
-                mask: log.messages.MON.IErr[i],
-                line: log.messages.MON.IErrLn[i],
-                count: log.messages.MON.IErrCnt[i]
+                time: MON.TimeUS[i],
+                mask: MON.IErr[i],
+                line: MON.IErrLn[i],
+                count: MON.IErrCnt[i]
             })
         }
     }
@@ -638,8 +734,15 @@ function print_device(parent, id) {
         // DroneCAN
         parent.appendChild(document.createTextNode(id.bus_type + " bus: " + id.bus + " node id: " + id.address + " sensor: " + id.sensor_id))
         parent.appendChild(document.createElement("br"))
-        if (can[id.address] != null) {
-            parent.appendChild(document.createTextNode("Name: " + can[id.address].name))
+        let can_device
+        if ((id.bus in can) && (id.address in can[id.bus])) {
+            can_device = can[id.bus][id.address][0]
+        } else if (("all" in can) && (id.address in can.all)) {
+            can_device = can.all[id.address][0]
+        }
+
+        if (can_device != null) {
+            parent.appendChild(document.createTextNode("Name: " + can_device.name))
         }
     } else {
         parent.appendChild(document.createTextNode(id.name + " via " + id.bus_type))
@@ -757,24 +860,14 @@ function load_ins(log) {
     for (let i = 0; i < max_num_ins; i++) {
         ins[i] = get_instance(params, i)
     }
-    if (log != null) {
-        log.parseAtOffset("IMU")
-        let found_instance = false
-        for (let i = 0; i < max_num_ins; i++) {
-            if (ins[i] != null) {
-                const name = "IMU[" + i + "]"
-                if ((name in log.messages) && (Object.keys(log.messages[name]).length > 0)) {
-                    found_instance = true
-                    ins[i].acc_all_healthy = array_all_equal(log.messages[name].AH, 1)
-                    ins[i].gyro_all_healthy = array_all_equal(log.messages[name].GH, 1)
+    if ((log != null) && ("IMU" in log.messageTypes)) {
+        if ("instances" in log.messageTypes.IMU) {
+            for (const inst of Object.keys(log.messageTypes.IMU.instances)) {
+                const i = parseFloat(inst)
+                if (ins[i] != null) {
+                    ins[i].acc_all_healthy = array_all_equal(log.get_instance("IMU", inst, "AH"), 1)
+                    ins[i].gyro_all_healthy = array_all_equal(log.get_instance("IMU", inst, "GH"), 1)
                 }
-            }
-        }
-        if (!found_instance && (Object.keys(log.messages.IMU).length > 0) && ('I' in log.messages.IMU)) {
-            const instance = log.messages.IMU.I[0]
-            if (ins[instance] != null) {
-                ins[instance].acc_all_healthy = array_all_equal(log.messages.IMU.AH, 1)
-                ins[instance].gyro_all_healthy = array_all_equal(log.messages.IMU.GH, 1)
             }
         }
     }
@@ -891,11 +984,17 @@ function load_compass(log) {
                  full_inst: true }
     }
 
-    compass[0] = get_instance(params, "COMPASS_PRIO1_ID")
-    compass[1] = get_instance(params, "COMPASS_PRIO2_ID")
-    compass[2] = get_instance(params, "COMPASS_PRIO3_ID")
-    for (let i = 3; i < 7; i++) {
-        const dev_id_name = "COMPASS_DEV_ID" + (i+1)
+    let dev_id_start = 0
+    for (let i = 0; i < 3; i++) {
+        const prio = get_instance(params, "COMPASS_PRIO" + (i+1) + "_ID")
+        if (prio != null) {
+            compass[i] = prio
+            dev_id_start = i + 1
+        }
+    }
+    for (let i = dev_id_start; i < 7; i++) {
+        const inst_num = (i == 0) ? "" : String(i+1)
+        const dev_id_name = "COMPASS_DEV_ID" + inst_num
         if (dev_id_name in params) {
             const id = params[dev_id_name]
             if (id != 0) {
@@ -904,26 +1003,16 @@ function load_compass(log) {
         }
     }
 
-    if (log != null) {
-        log.parseAtOffset("MAG")
-        let found_instance = false
-        for (let i = 0; i < 3; i++) {
-            if (compass[i] != null) {
-                const name = "MAG[" + i + "]"
-                if ((name in log.messages) && (Object.keys(log.messages[name]).length > 0)) {
-                    found_instance = true
-                    compass[i].all_healthy = array_all_equal(log.messages[name].Health, 1)
+    if ((log != null) && ("MAG" in log.messageTypes)) {
+        if ("instances" in log.messageTypes.MAG) {
+            for (const inst of Object.keys(log.messageTypes.MAG.instances)) {
+                const i = parseFloat(inst)
+                if (compass[i] != null) {
+                    compass[i].all_healthy = array_all_equal(log.get_instance("MAG", inst, "Health"), 1)
                 }
             }
         }
-        if (!found_instance && (Object.keys(log.messages.MAG).length > 0) && ('I' in log.messages.MAG)) {
-            const instance = log.messages.MAG.I[0]
-            if (compass[instance] != null) {
-                compass[instance].all_healthy = array_all_equal(log.messages.MAG.Health, 1)
-            }
-        }
     }
-
     function print_compass(inst, params) {
         let fieldset = document.createElement("fieldset")
 
@@ -1018,22 +1107,19 @@ function load_baro(log) {
         }
     }
 
-    if (log != null) {
-        log.parseAtOffset("BARO")
-        let found_instance = false
-        for (let i = 0; i < 3; i++) {
-            if (compass[i] != null) {
-                const name = "BARO[" + i + "]"
-                if ((name in log.messages) && (Object.keys(log.messages[name]).length > 0)) {
-                    found_instance = true
-                    baro[i].all_healthy = array_all_equal(log.messages[name].Health, 1)
+    if ((log != null) && ("BARO" in log.messageTypes)) {
+        if ("instances" in log.messageTypes.BARO) {
+            for (const inst of Object.keys(log.messageTypes.BARO.instances)) {
+                const i = parseFloat(inst)
+                if (baro[i] != null) {
+                    if (log.messageTypes.BARO.expressions.includes("Health")) {
+                        baro[i].all_healthy = array_all_equal(log.get_instance("BARO", inst, "Health"), 1)
+
+                    } else if (log.messageTypes.BARO.expressions.includes("H")) {
+                        baro[i].all_healthy = array_all_equal(log.get_instance("BARO", inst, "H"), 1)
+
+                    }
                 }
-            }
-        }
-        if (!found_instance && (Object.keys(log.messages.BARO).length > 0) && ('I' in log.messages.BARO)) {
-            const instance = log.messages.BARO.I[0]
-            if (baro[instance] != null) {
-                baro[instance].all_healthy = array_all_equal(log.messages.BARO.Health, 1)
             }
         }
     }
@@ -1111,7 +1197,7 @@ function get_airspeed_param_names(index) {
 let airspeed
 function load_airspeed(log) {
 
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 6; i++) {
         const names = get_airspeed_param_names(i)
         if (names.id in params) {
             const id = params[names.id]
@@ -1121,23 +1207,13 @@ function load_airspeed(log) {
             airspeed[i] = { id: id, use: params[names.use] }
         }
     }
-
-    if (log != null) {
-        log.parseAtOffset("ARSP")
-        let found_instance = false
-        for (let i = 0; i < 2; i++) {
-            if (airspeed[i] != null) {
-                const name = "ARSP[" + i + "]"
-                if ((name in log.messages) && (Object.keys(log.messages[name]).length > 0)) {
-                    found_instance = true
-                    airspeed[i].all_healthy = array_all_equal(log.messages[name].H, 1)
+    if ((log != null) && ("ARSP" in log.messageTypes)) {
+        if ("instances" in log.messageTypes.ARSP) {
+            for (const inst of Object.keys(log.messageTypes.ARSP.instances)) {
+                const i = parseFloat(inst)
+                if (airspeed[i] != null) {
+                    airspeed[i].all_healthy = array_all_equal(log.get_instance("ARSP", inst, "H"), 1)
                 }
-            }
-        }
-        if (!found_instance && (Object.keys(log.messages.ARSP).length > 0)) {
-            const instance = log.messages.ARSP.I[0]
-            if (airspeed[instance] != null) {
-                airspeed[instance].all_healthy = array_all_equal(log.messages.ARSP.H, 1)
             }
         }
     }
@@ -1192,7 +1268,23 @@ function load_airspeed(log) {
 // Load GPS
 let gps
 const max_num_gps = 2
-function load_gps() {
+function load_gps(log) {
+
+    function get_moving_base(prefix) {
+        const type_name = prefix + "TYPE"
+        if (!(type_name in params)) {
+            // Not found
+            return
+        }
+
+        if (params[type_name] != 1) {
+            // Must be type 1 to be using offsets
+            return
+        }
+
+        const names = get_param_name_vector3(prefix + "OFS_")
+        return get_param_array(params, names)
+    }
 
     for (let i = 0; i < max_num_gps; i++) {
         let index = String(i+1)
@@ -1206,11 +1298,126 @@ function load_gps() {
                 const pos_names = get_param_name_vector3("GPS_POS" + (i+1) + "_")
                 gps[i] = { type: type,
                            pos: get_param_array(params, pos_names),
-                           node_id: params["GPS_CAN_NODEID" + (i+1)] }
+                           node_id: params["GPS_CAN_NODEID" + (i+1)],
+                           moving_base: get_moving_base("GPS_MB" + (i+1) + "_" ) }
+            }
+            continue
+        }
+        const new_prefix = "GPS" + (i+1)
+        const new_type_name = new_prefix + "_TYPE"
+        if (new_type_name in params) {
+            // New per-instance params for 4.6+
+            const type = params[new_type_name]
+            if (type != 0) {
+                const pos_names = get_param_name_vector3(new_prefix + "_POS_")
+                gps[i] = { type: type,
+                           pos: get_param_array(params, pos_names),
+                           node_id: params[new_prefix + "_CAN_NODEID"],
+                           moving_base: get_moving_base(new_prefix + "_MB_") }
             }
         }
     }
 
+    if ((log != null) && ('MSG' in log.messageTypes)) {
+        const messages = log.get("MSG").Message
+
+        // This regular expression is used to get the word after "as" to get the GPS device name.
+        // (?<=as\s) will exclude the "as" and a whitespace from the regex and then (\S+) will match the next word.
+        const regex_gps_device = /(?<=as\s)(\S+)/i;
+        const regex_gps_number = /(?<=GPS\s)(\d+)/
+        for (const message of messages) {
+            if (message.startsWith("GPS")) {
+                const num_match = message.match(regex_gps_number)
+                const device_match = message.match(regex_gps_device)
+                if ((num_match != null) && (device_match != null)) {
+                    const gps_num = parseInt(num_match[0]) - 1
+                    gps[gps_num].device = device_match[0]
+                }
+            }
+        }
+    }
+
+    function print_gps(inst, gps_info) {
+        let fieldset = document.createElement("fieldset")
+
+        let heading = document.createElement("legend")
+        heading.innerHTML = "GPS " + (inst+1)
+        fieldset.appendChild(heading)
+
+        // Try and decode the type param
+        let types = []
+        types[0] = "None"
+        types[1] = "AUTO"
+        types[2] = "uBlox"
+        types[5] = "NMEA"
+        types[6] = "SiRF"
+        types[7] = "HIL"
+        types[8] = "SwiftNav"
+        types[9] = "DroneCAN"
+        types[10] = "SBF"
+        types[11] = "GSOF"
+        types[13] = "ERB"
+        types[14] = "MAV"
+        types[15] = "NOVA"
+        types[16] = "HemisphereNMEA"
+        types[17] = "uBlox-MovingBaseline-Base"
+        types[18] = "uBlox-MovingBaseline-Rover"
+        types[19] = "MSP"
+        types[20] = "AllyStar"
+        types[21] = "ExternalAHRS"
+        types[22] = "DroneCAN-MovingBaseline-Base"
+        types[23] = "DroneCAN-MovingBaseline-Rover"
+        types[24] = "UnicoreNMEA"
+        types[25] = "UnicoreMovingBaselineNMEA"
+        types[26] = "SBF-DualAntenna"
+
+        if (types[gps_info.type] != null) {
+            fieldset.appendChild(document.createTextNode("Type " + gps_info.type + ": " + types[gps_info.type]))
+            fieldset.appendChild(document.createElement("br"))
+        }
+
+        fieldset.appendChild(document.createTextNode(gps_info.device))
+        fieldset.appendChild(document.createElement("br"))
+
+        // If DroneCAN type we can print the node name
+        if ((gps_info.type == 9) || (gps_info.type == 22) || (gps_info.type == 23)) {
+
+            // Can't tell which bus, so give up if the node ID is found on both
+            let can_device
+            let can_count = 0
+            for (const [driver_num, can_driver] of Object.entries(can)) {
+                if (gps_info.node_id in can_driver) {
+                    can_device = can_driver[gps_info.node_id][0]
+                    can_count++
+                }
+            }
+
+            if ((can_device != null) && (can_count == 1)) {
+                fieldset.appendChild(document.createTextNode("Name: " + can_device.name))
+                fieldset.appendChild(document.createElement("br"))
+            }
+        }
+
+        return fieldset
+    }
+
+    let section = document.getElementById("GPS")
+    let table = document.createElement("table")
+    section.appendChild(table)
+
+    let have_section = false
+    for (let i = 0; i < gps.length; i++) {
+        if ((gps[i] != null) && ("device" in gps[i])) {
+            have_section = true
+            let colum = document.createElement("td")
+
+            colum.appendChild(print_gps(i, gps[i]))
+            table.appendChild(colum)
+        }
+    }
+
+    section.previousElementSibling.hidden = !have_section
+    section.hidden = !have_section
 }
 
 // Load Rangefinder
@@ -1228,9 +1435,9 @@ function load_rangefinder() {
         if (type_name in params) {
             const type = params[type_name]
             if (type != 0) {
-                const pos_prefix = prefix + "POS"
+                const pos_prefix = prefix + "POS_"
                 rangefinder[i] = { type: type,
-                                   pos: get_param_vector(params, pos_prefix) }
+                                   pos: get_param_array(params, get_param_name_vector3(pos_prefix)) }
             }
         }
     }
@@ -1247,9 +1454,9 @@ function load_flow() {
     if (type_name in params) {
         const type = params[type_name]
         if (type != 0) {
-            const pos_prefix = prefix + "POS"
+            const pos_prefix = prefix + "POS_"
             flow[0] = { type: type,
-                        pos: get_param_vector(params, pos_prefix) }
+                        pos: get_param_array(params, get_param_name_vector3(pos_prefix)) }
         }
     }
 
@@ -1258,15 +1465,16 @@ function load_flow() {
 // load VISO
 let viso
 const max_num_viso = 1
-function load_flow() {
+function load_viso() {
 
     const prefix = "VISO_"
     const type_name = prefix + "TYPE"
     if (type_name in params) {
         const type = params[type_name]
         if (type != 0) {
+            const pos_prefix = prefix + "POS_"
             viso[0] = { type: type,
-                        pos: get_param_vector(params, pos_prefix) }
+                        pos: get_param_array(params, get_param_name_vector3(pos_prefix)) }
         }
     }
 
@@ -1277,39 +1485,57 @@ function update_pos_plot() {
     let max_offset = 0
     let plot_index = 1
 
-    function set_plot_data(plot_data, pos_inst, max_offset) {
-        if (pos_inst == null) {
-            return max_offset
-        }
-        plot_data.x = [pos_inst.pos[0]]
-        plot_data.y = [pos_inst.pos[1]]
-        plot_data.z = [pos_inst.pos[2]]
+    function pos_valid(pos) {
+        return (pos[0] != null) && (pos[1] != null) && (pos[2] != null)
+    }
+
+    function set_plot_data(plot_data, pos) {
+        plot_data.x = [pos[0]]
+        plot_data.y = [pos[1]]
+        plot_data.z = [pos[2]]
         plot_data.visible = true
-        return Math.max(max_offset, Math.abs(pos_inst.pos[0]), Math.abs(pos_inst.pos[1]), Math.abs(pos_inst.pos[2]))
+        max_offset = Math.max(max_offset, Math.abs(pos[0]), Math.abs(pos[1]), Math.abs(pos[2]))
+    }
+
+    function set_plot_data_if_valid(plot_data, pos_inst) {
+        if ((pos_inst != null) && pos_valid(pos_inst.pos)) {
+            set_plot_data(plot_data, pos_inst.pos)
+        }
     }
 
     for (let i = 0; i < max_num_ins; i++) {
-        max_offset = set_plot_data(Sensor_Offset.data[plot_index], ins[i], max_offset)
+        set_plot_data_if_valid(Sensor_Offset.data[plot_index], ins[i])
         plot_index++
     }
 
     for (let i = 0; i < max_num_gps; i++) {
-        max_offset = set_plot_data(Sensor_Offset.data[plot_index], gps[i], max_offset)
-        plot_index++
+        set_plot_data_if_valid(Sensor_Offset.data[plot_index], gps[i])
+        if ((gps[i] != null) && pos_valid(gps[i].pos) && (gps[i].moving_base != null) && pos_valid(gps[i].moving_base)) {
+            Sensor_Offset.data[plot_index].name += " Master"
+            Sensor_Offset.data[plot_index].meta += " Master"
+            Sensor_Offset.data[plot_index + 1].name += " Slave"
+            Sensor_Offset.data[plot_index + 1].meta += " Slave"
+
+            // Slave position is relative to master
+            const slave_pos = array_sub(gps[i].pos, gps[i].moving_base)
+
+            set_plot_data(Sensor_Offset.data[plot_index + 1], slave_pos)
+        }
+        plot_index += 2
     }
 
     for (let i = 0; i < max_num_rangefinder; i++) {
-        max_offset = set_plot_data(Sensor_Offset.data[plot_index], rangefinder[i], max_offset)
+        set_plot_data_if_valid(Sensor_Offset.data[plot_index], rangefinder[i])
         plot_index++
     }
 
     for (let i = 0; i < max_num_flow; i++) {
-        max_offset = set_plot_data(Sensor_Offset.data[plot_index], flow[i], max_offset)
+        set_plot_data_if_valid(Sensor_Offset.data[plot_index], flow[i])
         plot_index++
     }
 
     for (let i = 0; i < max_num_viso; i++) {
-        max_offset = set_plot_data(Sensor_Offset.data[plot_index], viso[i], max_offset)
+        set_plot_data_if_valid(Sensor_Offset.data[plot_index], viso[i])
         plot_index++
     }
 
@@ -1438,7 +1664,7 @@ function update_minimal_config() {
             input.checked = false
         }
 
-        const title_string = present_params.join([separator = ', '])
+        const title_string = present_params.join(', ')
         input.setAttribute('title', title_string)
 
         let label = input.labels[0]
@@ -1451,8 +1677,10 @@ function load_params(log) {
     load_compass(log)
     load_baro(log)
     load_airspeed(log)
-    load_gps()
+    load_gps(log)
+    load_rangefinder()
     load_flow()
+    load_viso()
 
 
     if (Object.keys(params).length > 0) {
@@ -1466,9 +1694,9 @@ function load_params(log) {
 
     update_pos_plot()
 
-    // Be annoying if arming checks are disabled
-    if (("ARMING_CHECK" in params) && (params.ARMING_CHECK == 0)) {
-        alert("Arming checks disabled")
+    // Add warning if arming checks are disabled
+    if ((("ARMING_SKIPCHK" in params) && params.ARMING_SKIPCHK != 0) || (("ARMING_CHECK" in params) && params.ARMING_CHECK === 0)) {
+        add_warning("exclamation-triangle-orange", document.createTextNode("Arming checks disabled"))
     }
 
 }
@@ -1476,9 +1704,9 @@ function load_params(log) {
 function load_param_file(text) {
     var lines = text.split('\n')
     params = {}
-    for (i in lines) {
+    for (let i in lines) {
         var line = lines[i];
-        v = line.split(/[\s,=\t]+/)
+        let v = line.split(/[\s,=\t]+/)
         if (v.length >= 2) {
             var name = v[0]
             var value = v[1]
@@ -1491,19 +1719,57 @@ function load_param_file(text) {
 }
 
 let can
-function load_can(can_msgs) {
+function load_can(log) {
 
-    function add_msg(msg) {
-        can[msg.NodeId] = { name: msg.Name, 
-                                version: msg.Major + "." + msg.Minor }
+    if (!('CAND' in log.messageTypes)) {
+        return
     }
 
-    if (Array.isArray(can_msgs)) {
-        for (const can_msg of can_msgs) {
-            add_msg(can_msg)
+    const have_driver_num = log.messageTypes.CAND.expressions.includes("Driver")
+    for (const inst of Object.keys(log.messageTypes.CAND.instances)) {
+        const CAND = log.get_instance("CAND", inst)
+        const node_id = parseFloat(inst)
+
+        for (let i = 0; i < CAND.Name.length; i++) {
+            let driver = "all"
+            if (have_driver_num) {
+                driver = CAND.Driver[i]
+            }
+            if (can[driver] == null) {
+                can[driver] = []
+            }
+
+            if (can[driver][node_id] == null) {
+                can[driver][node_id] = []
+            }
+
+            // New obj
+            let can_obj = { 
+                name: CAND.Name[i],
+                version: CAND.Major[i] + "." + CAND.Minor[i],
+                UID1: CAND.UID1[i],
+                UID2: CAND.UID2[i],
+                hash: CAND.Version[i].toString(16).padStart(8, '0')
+            }
+
+            // Check for duplicates
+            let found = false
+            for (const existing of can[driver][node_id]) {
+                if ((existing.name == can_obj.name) && 
+                    (existing.version == can_obj.version) &&
+                    (existing.UID1 == can_obj.UID1) &&
+                    (existing.UID2 == can_obj.UID2) &&
+                    (existing.hash == can_obj.hash)) {
+                    found = true
+                    break
+                }
+            }
+
+            if (!found) {
+                // Add if not found
+                can[driver][node_id].push(can_obj)
+            }
         }
-    } else {
-        add_msg(can_msgs)
     }
 
     function print_can(inst, info) {
@@ -1516,23 +1782,48 @@ function load_can(can_msgs) {
 
         fieldset.appendChild(document.createTextNode("Name: " + info.name))
         fieldset.appendChild(document.createElement("br"))
+
         fieldset.appendChild(document.createTextNode("Firmware version: " + info.version))
+
+        const version_div = document.createElement("div")
+        version_div.style.display = "inline"
+        fieldset.appendChild(version_div)
+        if (info.name.startsWith("org.ardupilot")) {
+            check_release(info.hash, version_div)
+        }
+
+        fieldset.appendChild(document.createElement("br"))
+
+        fieldset.appendChild(document.createTextNode("UID1: 0x" + info.UID1.toString(16)))
+        fieldset.appendChild(document.createElement("br"))
+
+        fieldset.appendChild(document.createTextNode("UID2: 0x" + info.UID2.toString(16)))
 
         return fieldset
     }
 
     let section = document.getElementById("DroneCAN")
-    let table = document.createElement("table")
-    section.appendChild(table)
 
     let have_section = false
-    for (let i = 0; i < can.length; i++) {
-        if (can[i] != null) {
-            have_section = true
-            let colum = document.createElement("td")
+    for (const [driver_num, can_driver] of Object.entries(can)) {
+        if (have_driver_num) {
+            let heading = document.createElement("h4")
+            heading.appendChild(document.createTextNode("Driver " + driver_num + ":"))
+            section.appendChild(heading)
+        }
 
-            colum.appendChild(print_can(i, can[i]))
-            table.appendChild(colum)
+        let table = document.createElement("table")
+        section.appendChild(table)
+        for (let i = 0; i < can_driver.length; i++) {
+            if (can_driver[i] != null) {
+                for (let j = 0; j < can_driver[i].length; j++) {
+                    have_section = true
+                    let colum = document.createElement("td")
+
+                    colum.appendChild(print_can(i, can_driver[i][j]))
+                    table.appendChild(colum)
+                }
+            }
         }
     }
 
@@ -1599,24 +1890,24 @@ function load_waypoints(log) {
     }
 
     // Load missions
-    log.parseAtOffset("CMD")
-    if (('CMD' in log.messages) && (Object.keys(log.messages.CMD).length > 0)) {
+    if ('CMD' in log.messageTypes) {
+        const CMD = log.get("CMD")
 
         let missions = []
         let mission_inst = 0
-        for (let i = 0; i < log.messages.CMD.CTot.length; i++) {
+        for (let i = 0; i < CMD.CTot.length; i++) {
             const item = { 
-                command_total : log.messages.CMD.CTot[i],
-                sequence      : log.messages.CMD.CNum[i],
-                command       : log.messages.CMD.CId[i],
-                param1        : log.messages.CMD.Prm1[i],
-                param2        : log.messages.CMD.Prm2[i],
-                param3        : log.messages.CMD.Prm3[i],
-                param4        : log.messages.CMD.Prm4[i],
-                latitude      : log.messages.CMD.Lat[i],
-                longitude     : log.messages.CMD.Lng[i],
-                altitude      : log.messages.CMD.Alt[i],
-                frame         : log.messages.CMD.Frame[i]
+                command_total : CMD.CTot[i],
+                sequence      : CMD.CNum[i],
+                command       : CMD.CId[i],
+                param1        : CMD.Prm1[i],
+                param2        : CMD.Prm2[i],
+                param3        : CMD.Prm3[i],
+                param4        : CMD.Prm4[i],
+                latitude      : CMD.Lat[i],
+                longitude     : CMD.Lng[i],
+                altitude      : CMD.Alt[i],
+                frame         : CMD.Frame[i]
             }
 
             const index = item.sequence
@@ -1651,27 +1942,26 @@ function load_waypoints(log) {
             para2.appendChild(get_download_link("waypoints_" + i + ".txt", missions[i]))
         }
     }
-    delete log.messages.CMD
 
     // Load fence
-    log.parseAtOffset("FNCE")
-    if (('FNCE' in log.messages) && (Object.keys(log.messages.FNCE).length > 0)) {
+    if ('FNCE' in log.messageTypes) {
+        const FNCE = log.get("FNCE")
 
         let fences = []
         let fence_inst = 0
-        for (let i = 0; i < log.messages.FNCE.Tot.length; i++) {
+        for (let i = 0; i < FNCE.Tot.length; i++) {
 
             let command
             let p1
-            switch (log.messages.FNCE.Type[i]) {
+            switch (FNCE.Type[i]) {
                 case 98:
                     command = 5001
-                    p1 = log.messages.FNCE.Count[i]
+                    p1 = FNCE.Count[i]
                     break
 
                 case 97:
                     command = 5002
-                    p1 = log.messages.FNCE.Count[i]
+                    p1 = FNCE.Count[i]
                     break
 
                 case 95:
@@ -1681,12 +1971,12 @@ function load_waypoints(log) {
 
                 case 93:
                     command = 5004
-                    p1 = log.messages.FNCE.Radius[i]
+                    p1 = FNCE.Radius[i]
                     break
 
                 case 92:
                     command = 5003
-                    p1 = log.messages.FNCE.Radius[i]
+                    p1 = FNCE.Radius[i]
                     break
 
                 default:
@@ -1695,15 +1985,15 @@ function load_waypoints(log) {
             }
 
             const item = { 
-                command_total : log.messages.FNCE.Tot[i],
-                sequence      : log.messages.FNCE.Seq[i] + 1, // Offset by 1 since home it not included
+                command_total : FNCE.Tot[i],
+                sequence      : FNCE.Seq[i] + 1, // Offset by 1 since home it not included
                 command       : command,
                 param1        : p1,
                 param2        : 0,
                 param3        : 0,
                 param4        : 0,
-                latitude      : log.messages.FNCE.Lat[i],
-                longitude     : log.messages.FNCE.Lng[i],
+                latitude      : FNCE.Lat[i],
+                longitude     : FNCE.Lng[i],
                 altitude      : 0,
                 frame         : 0
             }
@@ -1740,21 +2030,20 @@ function load_waypoints(log) {
             para2.appendChild(get_download_link("fence_" + i + ".txt", fences[i]))
         }
     }
-    delete log.messages.FNCE
 
     // Load rally points
-    log.parseAtOffset("RALY")
-    if (('RALY' in log.messages) && (Object.keys(log.messages.RALY).length > 0)) {
+    if ('RALY' in log.messageTypes) {
+        const RALY = log.get("RALY")
 
         let rallypoints = []
         let rallyinst = 0
-        for (let i = 0; i < log.messages.RALY.Tot.length; i++) {
+        for (let i = 0; i < RALY.Tot.length; i++) {
 
             let alt_frame = 3 // MAV_FRAME_GLOBAL_RELATIVE_ALT
 
             // Decode flags if available
-            if ("Flags" in log.messages.RALY) {
-                const flags = log.messages.RALY.Flags[i]
+            if ("Flags" in RALY) {
+                const flags = RALY.Flags[i]
                 const alt_frame_valid = (flags & 0b0000100) != 0
                 const AP_alt_frame = (flags & 0b00011000) >> 3
 
@@ -1780,16 +2069,16 @@ function load_waypoints(log) {
             }
 
             const item = { 
-                command_total : log.messages.RALY.Tot[i],
-                sequence      : log.messages.RALY.Seq[i] + 1, // Offset by 1 since home it not included
+                command_total : RALY.Tot[i],
+                sequence      : RALY.Seq[i] + 1, // Offset by 1 since home it not included
                 command       : 5100, // MAV_CMD_NAV_RALLY_POINT
                 param1        : 0,
                 param2        : 0,
                 param3        : 0,
                 param4        : 0,
-                latitude      : log.messages.RALY.Lat[i],
-                longitude     : log.messages.RALY.Lng[i],
-                altitude      : log.messages.RALY.Alt[i],
+                latitude      : RALY.Lat[i],
+                longitude     : RALY.Lng[i],
+                altitude      : RALY.Alt[i],
                 frame         : alt_frame
             }
 
@@ -1826,7 +2115,6 @@ function load_waypoints(log) {
         }
 
     }
-    delete log.messages.RALY
 
 }
 
@@ -1834,23 +2122,447 @@ function plot_visibility(plot, hide) {
     plot.parentElement.hidden = hide
 }
 
-let params = {}
-let defaults = {}
-function load_log(log_file) {
-    let log = new DataflashParser()
-    log.processData(log_file, ['PARM', 'CAND', 'VER', 'MSG', 'HEAT', 'POWR', 'MCU', 'IMU', 'PM', 'STAK'])
+function plot_data_rate(log) {
 
-    if (('CAND' in log.messages) && (Object.keys(log.messages.CAND).length > 0)) {
-        load_can(log.messages.CAND)
-        delete log.messages.CAND
+    function add_datarate(name) {
+        const section = document.getElementById("DataRates")
+
+        section.hidden = false
+        section.previousElementSibling.hidden = false
+
+        const div = document.createElement("div")
+        section.appendChild(div)
+
+        const title = document.createElement("h4")
+        title.innerHTML = name
+        div.appendChild(title)
+
+        const plot = document.createElement("div")
+        plot.style = "width:800px; height:400px"
+        div.appendChild(plot)
+        return plot
     }
 
+    // UART data rates
+    if ('UART' in log.messageTypes) {
+
+        // Iterate over each instance
+        for (const inst of Object.keys(log.messageTypes.UART.instances)) {
+
+            // convert baud rate param value into baudrate
+            function map_baudrate(rate)
+            {
+                if (rate == null) {
+                    return
+                }
+                rate = parseInt(rate)
+
+                if (rate <= 0) {
+                    rate = 57
+                }
+                switch (rate) {
+                    case 1:    return 1200
+                    case 2:    return 2400
+                    case 4:    return 4800
+                    case 9:    return 9600
+                    case 19:   return 19200
+                    case 38:   return 38400
+                    case 57:   return 57600
+                    case 100:  return 100000
+                    case 111:  return 111100
+                    case 115:  return 115200
+                    case 230:  return 230400
+                    case 256:  return 256000
+                    case 460:  return 460800
+                    case 500:  return 500000
+                    case 921:  return 921600
+                    case 1500:  return 1500000
+                    case 2000:  return 2000000
+                }
+            
+                if (rate > 2000) {
+                    // assume it is a direct baudrate. This allows for users to
+                    // set an exact baudrate as long as it is over 2000 baud
+                    return rate
+                }
+            
+                // otherwise allow any other kbaud rate
+                return rate * 1000
+            }
+
+            const serial_protocols = {
+                "-1": "None",
+                 "0": "None",
+                 "1": "MAVLink1",
+                 "2": "MAVLink2",
+                 "3": "Frsky D",
+                 "4": "Frsky SPort",
+                 "5": "GPS",
+                 // SerialProtocol_GPS2
+                 "7": "Alexmos Gimbal Serial",
+                 "8": "Gimbal",
+                 "9": "Rangefinder",
+                "10": "FrSky SPort Passthrough (OpenTX)",
+                "11": "Lidar360",
+                // SerialProtocol_Aerotenna_USD1
+                "13": "Beacon",
+                "14": "Volz servo out",
+                "15": "SBus servo out",
+                "16": "ESC Telemetry",
+                "17": "Devo Telemetry",
+                "18": "OpticalFlow",
+                "19": "RobotisServo",
+                "20": "NMEA Output",
+                "21": "WindVane",
+                "22": "SLCAN",
+                "23": "RCIN",
+                "24": "EFI Serial",
+                "25": "LTM",
+                "26": "RunCam",
+                "27": "HottTelem",
+                "28": "Scripting",
+                "29": "Crossfire VTX",
+                "30": "Generator",
+                "31": "Winch",
+                "32": "MSP",
+                "33": "DJI FPV",
+                "34": "AirSpeed",
+                "35": "ADSB",
+                "36": "AHRS",
+                "37": "SmartAudio",
+                "38": "FETtecOneWire",
+                "39": "Torqeedo",
+                "40": "AIS",
+                "41": "CoDevESC",
+                "42": "DisplayPort",
+                "43": "MAVLink High Latency",
+                "44": "IRC Tramp",
+                "45": "DDS XRCE",
+                "46": "IMUDATA",
+                // Reserving Serial Protocol 47 for SerialProtocol_IQ
+                "48": "PPP",
+                "49": "i-BUS Telemetry",
+                "50": "IOMCU",
+            }
+
+            let title
+            let baud
+
+            function getProtocolName(num) {
+                if (num in serial_protocols) {
+                    return serial_protocols[num]
+                }
+                return "protocol " + num
+            }
+
+            function SerialTitle() {
+                const param_prefix = "SERIAL" + inst + "_"
+                const protocol_num = params[param_prefix + "PROTOCOL"]
+                if (protocol_num == undefined) {
+                    // Not a serial port
+                    return false
+                }
+                const name = getProtocolName(protocol_num)
+                title = `Serial ${inst}: ` + getProtocolName(protocol_num)
+
+                if (name == "IOMCU") {
+                    baud = 1500000
+                } else {
+                    baud = map_baudrate(params[param_prefix + "BAUD"])
+                    if (baud != null) {
+                        title += ", " + baud + " baud"
+                    }
+                }
+
+                return true
+            }
+
+            function NetTitle() {
+                const netInst = inst - 20
+                if (netInst < 1) {
+                    // Not a networking serial port
+                    return false
+                }
+                const param_prefix = "NET_P" + netInst + "_"
+                const protocol_num = params[param_prefix + "PROTOCOL"]
+                if (protocol_num == undefined) {
+                    // Not a networking serial port
+                    return false
+                }
+                title = `Networking Port ${netInst}: ` + getProtocolName(protocol_num)
+
+                const type = params[param_prefix + "TYPE"]
+                const types = {
+                    "1": "UDP client",
+                    "2": "UDP server",
+                    "3": "TCP client",
+                    "4": "TCP server",
+                }
+                if (type in types) {
+                    title += " " + types[type]
+                }
+
+                const IP0 = params[param_prefix + "IP0"]
+                const IP1 = params[param_prefix + "IP1"]
+                const IP2 = params[param_prefix + "IP2"]
+                const IP3 = params[param_prefix + "IP3"]
+                const PORT = params[param_prefix + "PORT"]
+
+                if (IP0 != undefined && IP1 != undefined && IP2 != undefined && IP3 != undefined && PORT != undefined) {
+                    title += ` ${IP0}.${IP1}.${IP2}.${IP3}:${PORT}`
+                }
+
+                return true
+            }
+
+            function DroneCANTitle(driverIst) {
+                const offset = driverIst == 1 ? 40 : 50
+                const DCInst = inst - offset
+                if (DCInst < 1) {
+                    // Not a DroneCAN serial port
+                    return false
+                }
+                const param_prefix = `CAN_D${driverIst}_UC_S${DCInst}_`
+                const protocol_num = params[param_prefix + "PRO"]
+                if (protocol_num == undefined) {
+                    // Not a DroneCAN serial port
+                    return false
+                }
+                title = `DroneCAN Driver ${driverIst} Port ${DCInst}: `
+
+                const node = params[param_prefix + "NOD"]
+                const index = params[param_prefix + "IDX"]
+                if (node != undefined && index != undefined) {
+                    title += `NodeID: ${node} Port: ${index} `
+                }
+
+                title += getProtocolName(protocol_num)
+
+                baud = map_baudrate(params[param_prefix + "BD"])
+                if (node != undefined && index != undefined) {
+                    title += " " + baud + " baud"
+                }
+
+                return true
+            }
+
+            function IOMCUTitle() {
+                if (inst != 100) {
+                    // Not IOMCU
+                    return false
+                }
+                baud = 1500000
+                title = "IOMCU, " + baud + " baud"
+                return true
+            }
+
+
+            if (!SerialTitle() && !NetTitle() && !DroneCANTitle(1) && !DroneCANTitle(2) && !IOMCUTitle()) {
+                // Generic title
+                title = "UART " + inst
+            }
+
+            const UART_inst = log.get_instance("UART", inst)
+            const time = TimeUS_to_seconds(UART_inst.TimeUS)
+
+            const Tx_name = "Transmit"
+            const Rx_name = "Receive"
+            const data = [
+                { x: time, y: UART_inst.Rx, name: Rx_name, meta: Rx_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} B/s" },
+                { x: time, y: UART_inst.Tx, name: Tx_name, meta: Tx_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} B/s" }
+            ]
+
+            if (baud != null) {
+                // 10 bits per byte, 8 + start + stop
+                const bytes_per_sec = baud / 10
+
+                const limit_name = "Baud limit"
+                const limit_x = [time[0], time[time.length-1]]
+                const limit_y = [bytes_per_sec, bytes_per_sec]
+
+                data.push({ x: limit_x, y: limit_y, name: limit_name, meta: limit_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} B/s", line: { dash: "dot", color: "#000000" },})
+            }
+
+            const layout = { 
+                legend: {itemclick: false, itemdoubleclick: false }, 
+                margin: { b: 50, l: 60, r: 50, t: 20 },
+                xaxis: { title: {text: "Time (s)" } },
+                yaxis: { title: {text: "Data rate (bytes/second)"}}
+            }
+
+            const plot_div = add_datarate(title)
+            Plotly.newPlot(plot_div, data, layout, {displaylogo: false});
+
+        }
+    }
+
+    // CAN data rates
+    if ('CANS' in log.messageTypes) {
+
+        // Iterate over each instance
+        for (const inst of Object.keys(log.messageTypes.CANS.instances)) {
+            const driver_inst = parseInt(inst) + 1
+
+            const options = params["CAN_D" + driver_inst + "_UC_OPTION"]
+            let FD = false
+            if ((options != null) && ((options & (1<<2)) != 0)) {
+                FD = true
+            }
+
+            let bitrate
+            for (let i = 1; i < 10; i++) {
+                const driver = params["CAN_P" + i + "_DRIVER"]
+                if (driver == driver_inst) {
+                    if (!FD) { 
+                        bitrate = parseInt(params["CAN_P" + i + "_BITRATE"])
+                    } else {
+                        bitrate = parseInt(params["CAN_P" + i + "_FDBITRATE"]) * 1000000
+                    }
+                    break
+                }
+            }
+
+            let title = "DroneCAN " + inst
+            if (bitrate != null) {
+                title += ": " + (bitrate/1000000) + "Mbit/s"
+            }
+
+            // Converting bitrate into a frame rate is a bit complicated.
+            // CANFD is even worse
+            let max_frame_limit
+            if ((bitrate != null) && !FD) {
+                // Give a worst case value by assumeing max size frames and worst bit stuffing.
+                // Bit stuffing gives a worst case frame length of 157 bits
+                // https://en.wikipedia.org/wiki/CAN_bus#Bit_stuffing
+                // There is also a 3 bit gap required between frames
+                // https://en.wikipedia.org/wiki/CAN_bus#Interframe_spacing
+                max_frame_limit = Math.floor(bitrate / (157 + 3))
+
+                // In relity not all frames will be max lenght and less bit stuffing will be required.
+                // Could add a less pessimistic estimate too...
+            }
+
+            const CANS_inst = log.get_instance("CANS", inst)
+            let time = TimeUS_to_seconds(CANS_inst.TimeUS)
+
+            // Convert cumulative counts into data rates
+            const len = time.length
+            let tx = new Array(len - 1)
+            let rx = new Array(len - 1)
+            let total = new Array(len - 1)
+            for (let i = 0; i<(len - 1); i++) {
+                const dt = time[i+1] - time[i]
+                tx[i] = (CANS_inst.T[i+1] - CANS_inst.T[i]) / dt
+                rx[i] = (CANS_inst.R[i+1] - CANS_inst.R[i]) / dt
+                total[i] = tx[i] + rx[i]
+            }
+
+            // Taking the diff means we have one less point
+            time.shift()
+
+            const Tx_name = "Transmit"
+            const Rx_name = "Receive"
+            const Total_name = "Total"
+            const data = [
+                { x: time, y: rx, name: Rx_name, meta: Rx_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} f/s" },
+                { x: time, y: tx, name: Tx_name, meta: Tx_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} f/s" },
+                { x: time, y: total, name: Total_name, meta: Total_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} f/s" }
+            ]
+
+            if (max_frame_limit != null) {
+                const limit_name = "Worst case limit"
+                const limit_x = [time[0], time[time.length-1]]
+                const limit_y = [max_frame_limit, max_frame_limit]
+
+                data.push({ x: limit_x, y: limit_y, name: limit_name, meta: limit_name, mode: 'lines', hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} f/s", line: { dash: "dot", color: "#000000" },})
+            }
+
+            const layout = { 
+                legend: {itemclick: false, itemdoubleclick: false }, 
+                margin: { b: 50, l: 60, r: 50, t: 20 },
+                xaxis: { title: {text: "Time (s)" } },
+                yaxis: { title: {text: "Data rate (CAN frames/second)"}}
+            }
+
+            const plot_div = add_datarate(title)
+            Plotly.newPlot(plot_div, data, layout, {displaylogo: false});
+
+            if (max_frame_limit != null) {
+                // Add a note to make the limit less scary
+                const txt = "Limit is a very pessimistic worst case. It assumes max length frames and worst data. The best case is more than twice as many frames, the reality will be somewhere in between."
+                const para = document.createElement("p")
+                para.style = "width:600px"
+                para.appendChild(document.createTextNode(txt))
+                plot_div.parentElement.insertBefore(para, plot_div)
+            }
+        }
+    }
+}
+
+// Add a new warning to the top of the page
+function add_warning(image, content) {
+    const warning_section = document.getElementById("warnings")
+    warning_section.hidden = false
+    warning_section.previousElementSibling.hidden = false
+
+    const table = document.createElement("table")
+    warning_section.appendChild(table)
+
+    const row = document.createElement("tr")
+    table.appendChild(row)
+
+    const icon_cell = document.createElement("td")
+    row.appendChild(icon_cell)
+
+    const img = document.createElement("img")
+    img.style.width = "40px"
+    img.style.verticalAlign = "bottom"
+    img.src = "../images/" + image + ".svg"
+    icon_cell.appendChild(img)
+
+    const content_cell = document.createElement("td")
+    row.appendChild(content_cell)
+
+    content_cell.appendChild(content)
+}
+
+// micro seconds to seconds helpers
+const US2S = 1 / 1000000
+function TimeUS_to_seconds(TimeUS) {
+    return array_scale(TimeUS, US2S)
+}
+
+let params = {}
+let defaults = {}
+async function load_log(log_file) {
+
+    // Make sure imports are fully loaded before starting
+    // This is needed when called from "open in"
+    await Promise.allSettled(import_done)
+
+    const start = performance.now()
+
+    let log = new DataflashParser()
+    log.processData(log_file, [])
+
+    open_in_update(log)
+
+    if (!('PARM' in log.messageTypes)) {
+        // The whole tool assumes it has param values
+        alert("No parameter values found in log")
+        return
+    }
+
+    // Loading CAN first allows Driver IDs to be anotated with node name when params are loaded
+    load_can(log)
+
+    const PARM = log.get("PARM")
     let param_changes = {}
     let param_time = {}
-    for (let i = 0; i < log.messages.PARM.Name.length; i++) {
-        const name = log.messages.PARM.Name[i]
-        const time = log.messages.PARM.time_boot_ms[i] * (1/1000)
-        const value = log.messages.PARM.Value[i]
+    for (let i = 0; i < PARM.Name.length; i++) {
+        const name = PARM.Name[i]
+        const time = PARM.TimeUS[i] * US2S
+        const value = PARM.Value[i]
 
         if ((name in params) && (params[name] != value)) {
             // Already seen this param with a different value record change
@@ -1863,18 +2575,15 @@ function load_log(log_file) {
 
         params[name] = value
         param_time[name] = time
-        if ("Default" in log.messages.PARM) {
-            const default_val = log.messages.PARM.Default[i]
+        if ("Default" in PARM) {
+            const default_val = PARM.Default[i]
             if (!isNaN(default_val)) {
                 defaults[name] = default_val
             }
         }
     }
-    delete log.messages.PARM
-    delete param_time
 
     show_param_changes(param_changes)
-    delete param_changes
 
     if (Object.keys(defaults).length > 0) {
         document.getElementById("SaveChangedParams").hidden = false
@@ -1884,149 +2593,116 @@ function load_log(log_file) {
 
     load_params(log)
 
-    const have_msg = ('MSG' in log.messages) && (Object.keys(log.messages.MSG).length > 0)
-    let flight_controller = null
-    let board_id = null
+    const version = get_version_and_board(log)
 
-    if (('VER' in log.messages) && (Object.keys(log.messages.VER).length > 0)) {
-        // Assume version does not change, just use first msg
-        const fw_string = log.messages.VER.FWS[0]
-        const hash = log.messages.VER.GH[0].toString(16)
-        board_id = log.messages.VER.APJ[0]
-        delete log.messages.VER
-
+    if (version.fw_string != null) {
         let section = document.getElementById("VER")
         section.hidden = false
         section.previousElementSibling.hidden = false
-        section.appendChild(document.createTextNode(fw_string))
+        section.appendChild(document.createTextNode(version.fw_string))
 
-        if (have_msg) {
-            // Look for firmware string in MSGs, this marks the start of the log start msgs
-            // The subsequent messages give more info, this is a bad way of doing it
-            const len = log.messages.MSG.Message.length
-            for (let i = 0; i < log.messages.MSG.Message.length - 3; i++) {
-                const msg = log.messages.MSG.Message[i]
-                if (fw_string != msg) {
-                    continue
-                }
-                if (!log.messages.MSG.Message[i+3].startsWith("Param space used:")) {
-                    // Check we have bracketed the messages we need
-                    continue
-                }
-                section.appendChild(document.createElement("br"))
-                section.appendChild(document.createTextNode(log.messages.MSG.Message[i+1]))
-                flight_controller = log.messages.MSG.Message[i+2]
-                break
-            }
+        if (version.os_string != null) {
+            section.appendChild(document.createElement("br"))
+            section.appendChild(document.createTextNode(version.os_string))
         }
 
-        check_release(hash, section)
-
+        if (version.fw_hash != null) {
+            check_release(version.fw_hash, section)
+        }
     }
 
-    if ((flight_controller != null) || (board_id != null)) {
+    const haveFlightController = version.flight_controller != null
+    const haveBoardId = version.board_id != null
+    if (haveFlightController || haveBoardId) {
         let section = document.getElementById("FC")
         section.hidden = false
         section.previousElementSibling.hidden = false
-        if (flight_controller != null) {
+        if (haveFlightController) {
             // Print name given in log
-            section.appendChild(document.createTextNode(flight_controller))
+            section.appendChild(document.createTextNode(version.flight_controller))
         }
-        if (board_id != null) {
+        if (haveBoardId) {
+            if (haveFlightController) {
+                section.appendChild(document.createElement("br"))
+                section.appendChild(document.createElement("br"))
+            }
+
             // Lookup the board ID
-            section.appendChild(document.createElement("br"))
-            section.appendChild(document.createElement("br"))
-            section.appendChild(document.createTextNode("Board ID: " + board_id))
-            if (board_id in board_types) {
-                section.appendChild(document.createTextNode(" " + board_types[board_id]))
+            section.appendChild(document.createTextNode("Board ID: " + version.board_id))
+            if (version.board_id in board_types) {
+                section.appendChild(document.createTextNode(" " + board_types[version.board_id]))
             }
         }
     }
 
     // Look for watchdog
-    log.parseAtOffset("WDOG")
-    if (('WDOG' in log.messages) && (Object.keys(log.messages.WDOG).length > 0)) {
-        show_watchdog(log.messages.WDOG)
-    }
-    delete log.messages.WDOG
+    show_watchdog(log)
 
     // Look for internal errors
-    log.parseAtOffset("MON")
     show_internal_errors(log)
-    delete log.messages.MON
 
     // IOMCU
-    log.parseAtOffset("IOMC")
-    if (('IOMC' in log.messages) && (Object.keys(log.messages.IOMC).length > 0)) {
+    if ('IOMC' in log.messageTypes) {
+        const IOMC = log.get("IOMC")
+
         let para = document.getElementById("IOMCU")
         para.hidden = false
         para.previousElementSibling.hidden = false
 
-        if ("RSErr" in log.messages.IOMC) {
-            const read_satus_error = Math.max(...log.messages.IOMC.RSErr)
+        if ("RSErr" in IOMC) {
+            const read_satus_error = Math.max(...IOMC.RSErr)
             para.appendChild(document.createTextNode("Status read errors: " + read_satus_error + " " + (read_satus_error == 0 ? "\u2705" : "\u274C")))
             para.appendChild(document.createElement("br"))
         }
 
-        const total_errors =  Math.max(...log.messages.IOMC.Nerr)
+        const total_errors =  Math.max(...IOMC.Nerr)
         para.appendChild(document.createTextNode("Flight Controller errors: " + total_errors + " " + (total_errors == 0 ? "\u2705" : "\u274C")))
         para.appendChild(document.createElement("br"))
 
-        const IOMCU_total_errors =  Math.max(...log.messages.IOMC.Nerr2)
+        const IOMCU_total_errors =  Math.max(...IOMC.Nerr2)
         para.appendChild(document.createTextNode("IOMCU errors: " + IOMCU_total_errors + " " + (IOMCU_total_errors == 0 ? "\u2705" : "\u274C")))
         para.appendChild(document.createElement("br"))
 
-        const delayed_packets =  Math.max(...log.messages.IOMC.NDel)
+        const delayed_packets =  Math.max(...IOMC.NDel)
         para.appendChild(document.createTextNode("Delayed packets: " + delayed_packets + " " + (delayed_packets == 0 ? "\u2705" : "\u274C")))
     }
-    delete log.messages.IOMC
 
-
-    const have_HEAT = ('HEAT' in log.messages) && (Object.keys(log.messages.HEAT).length > 0)
-    const have_POWR = ('POWR' in log.messages) && (Object.keys(log.messages.POWR).length > 0)
-    const have_POWR_temp = have_POWR && ('MTemp' in log.messages.POWR)
-    const have_MCU = ('MCU' in log.messages) && (Object.keys(log.messages.MCU).length > 0)
-    const have_IMU = ('IMU' in log.messages) && (Object.keys(log.messages.IMU).length > 0) && ('I' in log.messages.IMU)
+    const have_HEAT = 'HEAT' in log.messageTypes
+    const have_POWR = 'POWR' in log.messageTypes
+    const have_POWR_temp = have_POWR && log.messageTypes.POWR.expressions.includes('MTemp')
+    const have_MCU = 'MCU' in log.messageTypes
+    const have_IMU = 'IMU' in log.messageTypes
     if (have_HEAT || have_POWR_temp || have_MCU || have_IMU) {
         let plot = document.getElementById("Temperature")
         plot_visibility(plot, false)
 
         if (have_HEAT) {
-            const time = array_scale(Array.from(log.messages.HEAT.time_boot_ms), 1 / 1000)
+            const time = TimeUS_to_seconds(log.get("HEAT", "TimeUS"))
 
             Temperature.data[0].x = time
-            Temperature.data[0].y = Array.from(log.messages.HEAT.Targ)
+            Temperature.data[0].y = log.get("HEAT", "Targ")
 
             Temperature.data[1].x = time
-            Temperature.data[1].y = Array.from(log.messages.HEAT.Temp)
+            Temperature.data[1].y = log.get("HEAT", "Temp")
         }
 
         if (have_MCU) {
-            Temperature.data[2].x = array_scale(Array.from(log.messages.MCU.time_boot_ms), 1 / 1000)
-            Temperature.data[2].y = Array.from(log.messages.MCU.MTemp)
+            Temperature.data[2].x = TimeUS_to_seconds(log.get("MCU", "TimeUS"))
+            Temperature.data[2].y = log.get("MCU", "MTemp")
 
         } else if (have_POWR_temp) {
-            Temperature.data[2].x = array_scale(Array.from(log.messages.POWR.time_boot_ms), 1 / 1000)
-            Temperature.data[2].y = Array.from(log.messages.POWR.MTemp)
+            Temperature.data[2].x = TimeUS_to_seconds(log.get("POWR", "TimeUS"))
+            Temperature.data[2].y = log.get("POWR", "MTemp")
 
         }
 
         if (have_IMU) {
-            let have_instance = false
-            for (let i = 0; i < max_num_ins; i++) {
-                const inst_name = "IMU[" + i + "]"
-                if (inst_name in log.messages) {
-                    have_instance = true
-
-                    Temperature.data[3+i].x = array_scale(Array.from(log.messages[inst_name].time_boot_ms), 1 / 1000)
-                    Temperature.data[3+i].y = Array.from(log.messages[inst_name].T)
+            if ("instances" in log.messageTypes.IMU) {
+                for (const inst of Object.keys(log.messageTypes.IMU.instances)) {
+                    const i = parseFloat(inst)
+                    Temperature.data[3+i].x = TimeUS_to_seconds(log.get_instance("IMU", inst, "TimeUS"))
+                    Temperature.data[3+i].y = log.get_instance("IMU", inst, "T")
                 }
-            }
-
-            if (!have_instance) {
-                const instance = log.messages.IMU.I[0]
-                Temperature.data[3+instance].x = array_scale(Array.from(log.messages.IMU.time_boot_ms), 1 / 1000)
-                Temperature.data[3+instance].y = Array.from(log.messages.IMU.T)
             }
         }
 
@@ -2035,55 +2711,141 @@ function load_log(log_file) {
 
     // Voltage plot
     if (have_POWR || have_MCU) {
-        let plot = document.getElementById("Board_Voltage")
-        plot_visibility(plot, false)
+        let showPlot = false
 
         if (have_POWR) {
-            const time = array_scale(Array.from(log.messages.POWR.time_boot_ms), 1 / 1000)
+            const time = TimeUS_to_seconds(log.get("POWR", "TimeUS"))
 
-            Board_Voltage.data[1].x = time
-            Board_Voltage.data[1].y = Array.from(log.messages.POWR.VServo)
+            const servo = log.get("POWR", "VServo")
+            if (!array_all_NaN(servo)) {
+                Board_Voltage.data[1].x = time
+                Board_Voltage.data[1].y = servo
+                showPlot = true
+            }
 
-            Board_Voltage.data[2].x = time
-            Board_Voltage.data[2].y = Array.from(log.messages.POWR.Vcc)
 
-            if (!have_MCU && ('MVolt' in log.messages.POWR)) {
+            const vcc = log.get("POWR", "Vcc")
+            if (!array_all_NaN(vcc)) {
+                Board_Voltage.data[2].x = time
+                Board_Voltage.data[2].y = vcc
+                showPlot = true
+            }
+
+
+            if (!have_MCU && log.messageTypes.POWR.expressions.includes('MVolt')) {
                 Board_Voltage.data[3].x = time
-                Board_Voltage.data[3].y = Array.from(log.messages.POWR.MVolt)
+                Board_Voltage.data[3].y = log.get("POWR", "MVolt")
 
                 Board_Voltage.data[0].x = [...time, ...time.toReversed()]
-                Board_Voltage.data[0].y = [...Array.from(log.messages.POWR.MVmax), ...Array.from(log.messages.POWR.MVmin).toReversed()]
+                Board_Voltage.data[0].y = [...log.get("POWR", "MVmax"), ...log.get("POWR", "MVmin").toReversed()]
+
+                showPlot = true
             }
         }
 
         if (have_MCU) {
-            const time = array_scale(Array.from(log.messages.MCU.time_boot_ms), 1 / 1000)
+            const time = TimeUS_to_seconds(log.get("MCU", "TimeUS"))
 
             Board_Voltage.data[3].x = time
-            Board_Voltage.data[3].y = Array.from(log.messages.MCU.MVolt)
+            Board_Voltage.data[3].y = log.get("MCU", "MVolt")
 
             Board_Voltage.data[0].x = [...time, ...time.toReversed()]
-            Board_Voltage.data[0].y = [...Array.from(log.messages.MCU.MVmax), ...Array.from(log.messages.MCU.MVmin).toReversed()]
+            Board_Voltage.data[0].y = [...log.get("MCU", "MVmax"), ...log.get("MCU", "MVmin").toReversed()]
 
+            showPlot = true
         }
 
-        Plotly.redraw(plot)
+        if (showPlot) {
+            let plot = document.getElementById("Board_Voltage")
+            plot_visibility(plot, false)
+            Plotly.redraw(plot)
+        }
     }
-    delete log.messages.POWR
-    delete log.messages.MCU
+
+    // Power flags
+    if (have_POWR) {
+
+        // Bitmask values for flags
+        const MAV_POWER_STATUS = {
+            BRICK_VALID: 1 << 0,
+            SERVO_VALID: 1 << 1,
+            USB_CONNECTED: 1 << 2,
+            PERIPH_OVERCURRENT: 1 << 3,
+            PERIPH_HIPOWER_OVERCURRENT: 1 << 4,
+            CHANGED: 1 << 5,
+        }
+
+        // Helper to decode bitmask to 0 or 1 array
+        function array_bit_set(A, val) {
+            const len = A.length
+            let ret = new Array(len)
+            for (let i = 0; i<len; i++) {
+                ret[i] = ((A[i] & val) != 0) ? 1 : 0
+            }
+            return ret
+        }
+
+        // Deal with log field name hange
+        let AccFlags_name
+        if (log.messageTypes.POWR.expressions.includes("AccFlags")) {
+            AccFlags_name = "AccFlags"
+        } else {
+            AccFlags_name = "AccFlg"
+        }
+
+        let flag_name
+        if (log.messageTypes.POWR.expressions.includes("Flags")) {
+            flag_name = "Flags"
+        } else {
+            flag_name = "Flg"
+        }
+
+        // Only plot if there is some change
+        let show_flags = log.messageTypes.POWR.expressions.includes(flag_name)
+        if (show_flags && log.messageTypes.POWR.expressions.includes(AccFlags_name) && array_all_equal(array_bit_set(log.get("POWR", AccFlags_name), MAV_POWER_STATUS.CHANGED), 0)) {
+            show_flags = false
+        }
+
+        if (show_flags) {
+            let plot = document.getElementById("power_flags")
+            plot_visibility(plot, false)
+
+            const flags = log.get("POWR", flag_name)
+            const time = TimeUS_to_seconds(log.get("POWR", "TimeUS"))
+
+            power_flags.data[0].x = time
+            power_flags.data[0].y = array_bit_set(flags, MAV_POWER_STATUS.BRICK_VALID)
+
+            power_flags.data[1].x = time
+            power_flags.data[1].y = array_bit_set(flags, MAV_POWER_STATUS.SERVO_VALID)
+
+            power_flags.data[2].x = time
+            power_flags.data[2].y = array_bit_set(flags, MAV_POWER_STATUS.USB_CONNECTED)
+
+            power_flags.data[3].x = time
+            power_flags.data[3].y = array_bit_set(flags, MAV_POWER_STATUS.PERIPH_OVERCURRENT)
+
+            power_flags.data[4].x = time
+            power_flags.data[4].y = array_bit_set(flags, MAV_POWER_STATUS.PERIPH_HIPOWER_OVERCURRENT)
+
+            Plotly.redraw(plot)
+        }
+    }
 
     // Performance
-    if (('PM' in log.messages) && (Object.keys(log.messages.PM).length > 0)) {
+    if ('PM' in log.messageTypes) {
+        const PM = log.get("PM")
+
         document.getElementById("CPU").hidden = false
 
         // Load
         let plot = document.getElementById("performance_load")
         plot_visibility(plot, false)
 
-        const time = array_scale(Array.from(log.messages.PM.time_boot_ms), 1 / 1000)
+        const time = TimeUS_to_seconds(PM.TimeUS)
 
         performance_load.data[0].x = time
-        performance_load.data[0].y = array_scale(Array.from(log.messages.PM.Load), 1 / 10)
+        performance_load.data[0].y = array_scale(PM.Load, 1 / 10)
         
         Plotly.redraw(plot)
 
@@ -2092,7 +2854,7 @@ function load_log(log_file) {
         plot_visibility(plot, false)
 
         performance_mem.data[0].x = time
-        performance_mem.data[0].y = Array.from(log.messages.PM.Mem)
+        performance_mem.data[0].y = PM.Mem
 
         Plotly.redraw(plot)
 
@@ -2101,31 +2863,30 @@ function load_log(log_file) {
         plot_visibility(plot, false)
 
         performance_time.data[0].x = time
-        performance_time.data[0].y = array_inverse(array_scale(Array.from(log.messages.PM.MaxT), 1 / 1000000))
+        performance_time.data[0].y = array_inverse(array_scale(PM.MaxT, 1 / 1000000))
 
-        if ("LR" in log.messages.PM) {
+        if ("LR" in PM) {
             performance_time.data[1].x = time
-            performance_time.data[1].y = Array.from(log.messages.PM.LR)
+            performance_time.data[1].y = PM.LR
         }
 
         Plotly.redraw(plot)
 
     }
-    delete log.messages.PM
 
-    if (('STAK' in log.messages) && (Object.keys(log.messages.STAK).length > 0)) {
+    plot_data_rate(log)
+
+    if ('STAK' in log.messageTypes) {
         let stack = []
-        for (let i = 0; i <= 255; i++) {
-            const name = "STAK[" + i + "]"
-            if (name in log.messages) {
-                // Assume id, priority and name do not change
-                stack.push({ id: i, 
-                             priority: log.messages[name].Pri[0],
-                             name: log.messages[name].Name[0],
-                             time: array_scale(Array.from(log.messages[name].time_boot_ms), 1 / 1000),
-                             total_size: Array.from(log.messages[name].Total),
-                             free: Array.from(log.messages[name].Free)})
-            }
+        for (const inst of Object.keys(log.messageTypes.STAK.instances)) {
+            // Assume id, priority and name do not change
+            const STAK_inst = log.get_instance("STAK", inst)
+            stack.push({ id: parseFloat(inst), 
+                         priority: STAK_inst.Pri[0],
+                         name: STAK_inst.Name[0],
+                         time: TimeUS_to_seconds(STAK_inst.TimeUS),
+                         total_size: STAK_inst.Total,
+                         free: STAK_inst.Free})
         }
 
         // Sort by priority, most important first
@@ -2143,7 +2904,7 @@ function load_log(log_file) {
 
         document.getElementById("Stack").hidden = false
 
-        plot = document.getElementById("stack_mem")
+        let plot = document.getElementById("stack_mem")
         plot_visibility(plot, false)
         Plotly.purge(plot)
         Plotly.newPlot(plot, stack_mem.data, stack_mem.layout, {displaylogo: false});
@@ -2154,52 +2915,72 @@ function load_log(log_file) {
         Plotly.newPlot(plot, stack_pct.data, stack_pct.layout, {displaylogo: false});
 
     }
-    delete log.messages.STAK
 
     // Add download link for missions, fence and rally points
     load_waypoints(log)
 
     // Add download link for embedded files
-    log.parseAtOffset("FILE")
-    log.processFiles()
-    if (Object.keys(log.files).length > 0) {
-        let para = document.getElementById("FILES")
-        para.hidden = false
-        para.previousElementSibling.hidden = false
+    if ('FILE' in log.messageTypes) {
+        log.parseAtOffset("FILE")
+        log.processFiles()
+        if (Object.keys(log.files).length > 0) {
+            let para = document.getElementById("FILES")
+            para.hidden = false
+            para.previousElementSibling.hidden = false
 
-        let first_item = true
-        for (const [name, contents] of Object.entries(log.files)) {
-            if (!first_item) {
-                para.appendChild(document.createTextNode(", "))
+            let first_item = true
+            for (const [name, contents] of Object.entries(log.files)) {
+                if (!first_item) {
+                    para.appendChild(document.createTextNode(", "))
+                }
+                first_item = false
+
+
+                let link = document.createElement("a")
+                link.title = "download file"
+                link.innerHTML = name
+                link.href = "#"
+                link.addEventListener('click', function() { saveAs(new Blob([contents]), name) })
+
+                para.appendChild(link)
+
+                if (name.endsWith("crash_dump.bin")) {
+                    // The dev-team want to hear about crash dumps.
+                    const content = document.createElement("div")
+                    content.appendChild(document.createTextNode("Crash dump file detected."))
+                    content.appendChild(document.createElement("br"))
+                    content.appendChild(document.createTextNode("For more information see ArduPilot "))
+
+                    const link = document.createElement("a")
+                    link.href = "https://ardupilot.org/copter/docs/common-watchdog.html#crash-dump"
+                    link.appendChild(document.createTextNode("documentation"))
+
+                    content.appendChild(link)
+                    content.appendChild(document.createTextNode("."))
+
+                    add_warning("exclamation-triangle-red", content)
+                }
+
             }
-            first_item = false
-
-
-            let link = document.createElement("a")
-            link.title = "download file"
-            link.innerHTML = name
-            link.href = "#"
-            link.addEventListener('click', function() { saveAs(new Blob([contents]), name) })
-
-            para.appendChild(link)
-
         }
+        log.messages.FILE = null
+        log.files = null
     }
-    delete log.messages.FILE
 
     // Logging dropped packets and free buffer
-    log.parseAtOffset("DSF")
-    if (('DSF' in log.messages) && (Object.keys(log.messages.DSF).length > 0)) {
+    if ('DSF' in log.messageTypes) {
+        const DSF = log.get("DSF")
+
         document.getElementById("log_stats_header").hidden = false
 
-        const time = array_scale(Array.from(log.messages.DSF.time_boot_ms), 1 / 1000)
+        const time = TimeUS_to_seconds(DSF.TimeUS)
 
         // Dropped packets
-        plot = document.getElementById("log_dropped")
+        let plot = document.getElementById("log_dropped")
         plot_visibility(plot, false)
 
         log_dropped.data[0].x = time
-        log_dropped.data[0].y = Array.from(log.messages.DSF.Dp)
+        log_dropped.data[0].y = DSF.Dp
 
         Plotly.redraw(plot)
 
@@ -2208,24 +2989,23 @@ function load_log(log_file) {
         plot_visibility(plot, false)
 
         log_buffer.data[0].x = time
-        log_buffer.data[0].y = Array.from(log.messages.DSF.FMx)
+        log_buffer.data[0].y = DSF.FMx
 
         log_buffer.data[1].x = time
-        log_buffer.data[1].y = Array.from(log.messages.DSF.FAv)
+        log_buffer.data[1].y = DSF.FAv
 
         log_buffer.data[2].x = time
-        log_buffer.data[2].y = Array.from(log.messages.DSF.FMn)
+        log_buffer.data[2].y = DSF.FMn
 
         Plotly.redraw(plot)
     }
-    delete log.messages.DSF
 
     // Plot stats
     let stats = log.stats()
     if (stats) {
         document.getElementById("log_stats_header").hidden = false
 
-        plot = document.getElementById("log_stats")
+        let plot = document.getElementById("log_stats")
         plot_visibility(plot, false)
 
         log_stats.data[0].labels = []
@@ -2242,15 +3022,118 @@ function load_log(log_file) {
         )
     }
 
+    // Plot clock drift
+    if (('GPS' in log.messageTypes) && ("instances" in log.messageTypes.GPS)) {
+
+        let start_us
+        let end_us
+        let max_drift
+
+        for (const inst of Object.keys(log.messageTypes.GPS.instances)) {
+            // Check each instance
+            if (inst == 2) {
+                // Ignore blended instance
+                continue
+            } 
+
+            const time_us = log.get_instance("GPS", inst, "TimeUS")
+            const status = log.get_instance("GPS", inst, "Status")
+            const weeks = log.get_instance("GPS", inst, "GWk")
+            const ms = log.get_instance("GPS", inst, "GMS")
+
+            const len = time_us.length
+            const drift_ms = new Array(len).fill(NaN)
+            let first
+            let have_drift = false
+            for (let i = 0; i<len; i++) {
+                if (status[i] < 3) {
+                    // Fix not good enough for valid time
+                    continue
+                }
+
+                if ((weeks[i] <= 1000) || (ms[i] == 0)) {
+                    // Invalid timestamp
+                    continue
+                }
+
+                // Calculate GPS time in milli seconds
+                const ms_per_week = 7 * 24 * 60 * 60 * 1000
+                const GPS_ms = (weeks[i] * ms_per_week) + ms[i]
+
+                if (first == null) {
+                    // sync at first point
+                    drift_ms[i] = 0
+                    first = { GPS_ms, time_us: time_us[i] }
+                    continue
+                }
+
+                const GPS_dt = GPS_ms - first.GPS_ms
+                const clock_dt = (time_us[i] - first.time_us) * 0.001
+
+                drift_ms[i] = GPS_dt - clock_dt
+                have_drift = true;
+
+                if ((start_us == null) || (first.time_us < start_us)) {
+                    start_us = first.time_us
+                }
+                if ((end_us == null) || (time_us[i] > end_us)) {
+                    end_us = time_us[i]
+                }
+                const abs_drift = Math.abs(drift_ms[i])
+                if ((max_drift == null) || (abs_drift > max_drift)) {
+                    max_drift = abs_drift
+                }
+            }
+
+            if (!have_drift) {
+                // nothing to plot
+                continue
+            }
+
+            const name = "GPS " + inst
+
+            clock_drift.data.push({
+                mode: 'lines',
+                x: TimeUS_to_seconds(time_us),
+                y: drift_ms,
+                name: name,
+                meta: name,
+                hovertemplate: "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f} ms"
+            })
+        }
+
+        if (clock_drift.data.length > 0) {
+            let plot = document.getElementById("clock_drift")
+
+            // Set range such that only bad drift will show
+            const time_range_ms = (end_us - start_us) * 0.001
+
+            // Set full scale to +-1000ppm so expected jitter does not look bad
+            const min_drift = time_range_ms * 1000 * 10**-6
+            if (max_drift < min_drift) {
+                plot.layout.yaxis.range = [ -min_drift,  min_drift ]
+                plot.layout.yaxis.autorange = false
+            }
+
+            plot_visibility(plot, false)
+            Plotly.redraw(plot)
+        }
+    }
+
+    const end = performance.now()
+    console.log(`Load took: ${end - start} ms`)
 }
 
-async function load(e) {
+function load() {
     reset()
 
-    const file = e.files[0]
+    const button = document.getElementById("fileItem")
+    const file = button.files[0]
     if (file == null) {
         return
     }
+
+    document.title = "Hardware Report: " + file.name
 
     if (file.name.toLowerCase().endsWith(".bin")) {
         let reader = new FileReader()
@@ -2260,7 +3143,9 @@ async function load(e) {
         reader.readAsArrayBuffer(file)
 
     } else {
-        load_param_file(await file.text())
+        loading_call(async () => {
+            load_param_file(await file.text())
+        })
     }
 
 }
@@ -2268,6 +3153,7 @@ async function load(e) {
 let Sensor_Offset = {}
 let Temperature = {}
 let Board_Voltage = {}
+let power_flags = {}
 let performance_load = {}
 let performance_mem = {}
 let performance_time = {}
@@ -2276,7 +3162,10 @@ let stack_pct = {}
 let log_dropped = {}
 let log_buffer = {}
 let log_stats = {}
+let clock_drift = {}
 function reset() {
+
+    document.title = "ArduPilot Hardware Report"
 
     function setup_section(section) {
         // Remove all children
@@ -2287,6 +3176,7 @@ function reset() {
         section.previousElementSibling.hidden = true
     }
 
+    setup_section(document.getElementById("warnings"))
     setup_section(document.getElementById("VER"))
     setup_section(document.getElementById("FC"))
     setup_section(document.getElementById("WDOG"))
@@ -2299,6 +3189,8 @@ function reset() {
     setup_section(document.getElementById("DroneCAN"))
     setup_section(document.getElementById("WAYPOINTS"))
     setup_section(document.getElementById("FILES"))
+    setup_section(document.getElementById("GPS"))
+    setup_section(document.getElementById("DataRates"))
 
     ins = []
     compass = []
@@ -2330,7 +3222,7 @@ function reset() {
         input.disabled = false
         input.setAttribute("data-params", params)
 
-        const title_string = params.join([separator = ', '])
+        const title_string = params.join(', ')
         input.setAttribute('title', title_string)
 
         let label = input.labels[0]
@@ -2435,18 +3327,24 @@ function reset() {
         if (document.getElementById("param_stream_" + i).checked) {
             continue
         }
-        const SR_prefix = "SR" + i + "_"
-        const SR_names = [ SR_prefix + "RAW_SENS", 
-                           SR_prefix + "EXT_STAT",
-                           SR_prefix + "RC_CHAN",
-                           SR_prefix + "RAW_CTRL",
-                           SR_prefix + "POSITION",
-                           SR_prefix + "EXTRA1",
-                           SR_prefix + "EXTRA2",
-                           SR_prefix + "EXTRA3",
-                           SR_prefix + "PARAMS",
-                           SR_prefix + "ADSB"]
-        setup_minimal_param("param_stream_" + i, SR_names)
+        function get_stream_rates(prefix) {
+            return [
+                prefix + "RAW_SENS", 
+                prefix + "EXT_STAT",
+                prefix + "RC_CHAN",
+                prefix + "RAW_CTRL",
+                prefix + "POSITION",
+                prefix + "EXTRA1",
+                prefix + "EXTRA2",
+                prefix + "EXTRA3",
+                prefix + "PARAMS",
+                prefix + "ADSB",
+                prefix + "OPTIONS"
+            ]
+        }
+        const SR_names = get_stream_rates(`SR${i}_`)
+        const MAV_names = get_stream_rates(`MAV${i+1}_`)
+        setup_minimal_param("param_stream_" + i, SR_names.concat(MAV_names))
     }
 
 
@@ -2463,7 +3361,9 @@ function reset() {
     }
 
     for (let i = 0; i < max_num_gps; i++) {
+        // Push two point for each GPS to allow ploting of master and slave
         name = "GPS " + (i+1)
+        Sensor_Offset.data.push({ mode: "markers", type: 'scatter3d', name: name, meta: name, visible: false, hovertemplate: offset_hover })
         Sensor_Offset.data.push({ mode: "markers", type: 'scatter3d', name: name, meta: name, visible: false, hovertemplate: offset_hover })
     }
 
@@ -2483,20 +3383,21 @@ function reset() {
     }
 
     const origin_size = 0.2
+    const cone_size = origin_size * 2.0
 
     // X
     const x_color = 'rgb(0,0,255)'
-    Sensor_Offset.data.push({type: "cone", x: [origin_size], y: [0], z: [0], u: [origin_size], v: [0], w: [0], sizemode: "absolute", showscale: false, hoverinfo: "none", colorscale:[[0, x_color], [1, x_color]]})
+    Sensor_Offset.data.push({type: "cone", x: [origin_size], y: [0], z: [0], u: [origin_size], v: [0], w: [0], sizemode: "raw", sizeref: cone_size, showscale: false, hoverinfo: "none", colorscale:[[0, x_color], [1, x_color]]})
     Sensor_Offset.data.push({type: 'scatter3d', mode: 'lines', x: [0,origin_size], y: [0,0], z: [0,0], showlegend: false, hoverinfo: "none", line: {color: x_color, width: 10 }})
 
     // Y
     const y_color = 'rgb(255,0,0)'
-    Sensor_Offset.data.push({type: "cone", x: [0], y: [origin_size], z: [0], u: [0], v: [origin_size], w: [0], sizemode: "absolute", showscale: false, hoverinfo: "none", colorscale:[[0, y_color], [1, y_color]]})
+    Sensor_Offset.data.push({type: "cone", x: [0], y: [origin_size], z: [0], u: [0], v: [origin_size], w: [0], sizemode: "raw", sizeref: cone_size, showscale: false, hoverinfo: "none", colorscale:[[0, y_color], [1, y_color]]})
     Sensor_Offset.data.push({type: 'scatter3d', mode: 'lines', x: [0,0], y: [0,origin_size], z: [0,0], showlegend: false, hoverinfo: "none", line: {color: y_color, width: 10 }})
 
     // Z
     const z_color = 'rgb(0,255,0)'
-    Sensor_Offset.data.push({type: "cone", x: [0], y: [0], z: [origin_size], u: [0], v: [0], w: [origin_size], sizemode: "absolute", showscale: false, hoverinfo: "none", colorscale:[[0, z_color], [1, z_color]]})
+    Sensor_Offset.data.push({type: "cone", x: [0], y: [0], z: [origin_size], u: [0], v: [0], w: [origin_size], sizemode: "raw", sizeref: cone_size, showscale: false, hoverinfo: "none", colorscale:[[0, z_color], [1, z_color]]})
     Sensor_Offset.data.push({type: 'scatter3d', mode: 'lines', x: [0,0], y: [0,0], z: [0,origin_size], showlegend: false, hoverinfo: "none", line: {color: z_color, width: 10 }})
 
     Sensor_Offset.layout = {
@@ -2568,6 +3469,35 @@ function reset() {
     plot = document.getElementById("Board_Voltage")
     Plotly.purge(plot)
     Plotly.newPlot(plot, Board_Voltage.data, Board_Voltage.layout, {displaylogo: false});
+    plot_visibility(plot, true)
+
+    // Power flags
+    const power_flags_hover_tmmplate = "<extra></extra>%{meta}<br>%{x:.2f} s<br>%{y:.2f}"
+    power_flags.data = []
+
+    name = "Primary<br>power supply"
+    power_flags.data.push({ mode: 'lines', name: name, meta: name, hovertemplate: power_flags_hover_tmmplate })
+
+    name = "Secondary<br>power supply"
+    power_flags.data.push({ mode: 'lines', name: name, meta: name, hovertemplate: power_flags_hover_tmmplate })
+
+    name = "USB power"
+    power_flags.data.push({ mode: 'lines', name: name, meta: name, hovertemplate: power_flags_hover_tmmplate })
+
+    name = "Peripheral<br>overcurrent"
+    power_flags.data.push({ mode: 'lines', name: name, meta: name, hovertemplate: power_flags_hover_tmmplate })
+
+    name = "Peripheral<br>high power<br>overcurrent"
+    power_flags.data.push({ mode: 'lines', name: name, meta: name, hovertemplate: power_flags_hover_tmmplate })
+
+    power_flags.layout = { legend: {itemclick: false, itemdoubleclick: false }, 
+                                margin: { b: 50, l: 50, r: 50, t: 20 },
+                                xaxis: { title: {text: time_scale_label } },
+                                yaxis: { title: {text: "Power flags" }, rangemode: "tozero" } }
+
+    plot = document.getElementById("power_flags")
+    Plotly.purge(plot)
+    Plotly.newPlot(plot, power_flags.data, power_flags.layout, {displaylogo: false});
     plot_visibility(plot, true)
 
     // Performace load
@@ -2699,6 +3629,20 @@ function reset() {
     Plotly.newPlot(plot, log_stats.data, log_stats.layout, {displaylogo: false});
     plot_visibility(plot, true)
 
+    // Clock drift
+    clock_drift.data = []
+    clock_drift.layout = { 
+        legend: { itemclick: false, itemdoubleclick: false }, 
+        margin: { b: 50, l: 50, r: 50, t: 20 },
+        xaxis: { title: { text: time_scale_label } },
+        yaxis: { title: { text: "Clock drift (ms)" } }
+    }
+
+    plot = document.getElementById("clock_drift")
+    Plotly.purge(plot)
+    Plotly.newPlot(plot, clock_drift.data, clock_drift.layout, {displaylogo: false});
+    plot_visibility(plot, true)
+
 }
 
 let board_types = {}
@@ -2723,16 +3667,25 @@ async function initial_load() {
         }
     }
 
-
-    fetch("board_types.txt")
-        .then((res) => {
-        return res.text();
-    }).then((data) => load_board_types(data));
+    return new Promise((resolve) => {
+        fetch("board_types.txt")
+            .then((res) => {
+            return res.text()
+        }).then((data) => {
+            load_board_types(data)
+            resolve()
+        });
+    })
 }
 
 function save_text(text, file_postfix) {
 
-    const log_file_name = document.getElementById("fileItem").value.replace(/.*[\/\\]/, '')
+    let log_file_name = document.getElementById("fileItem").value.replace(/.*[/\\]/, '')
+    if (log_file_name.length == 0) {
+        // May not have a file name if loaded with "open in"
+        log_file_name = "log"
+    }
+
     const file_name = (log_file_name.substr(0, log_file_name.lastIndexOf('.')) || log_file_name) + file_postfix
 
     var blob = new Blob([text], { type: "text/plain;charset=utf-8" });
@@ -2745,12 +3698,7 @@ function save_all_parameters() {
         return
     }
 
-    let text = ""
-    for (const [name, value] of Object.entries(params)) {
-        text += name + "," + value + "\n";
-    }
-
-    save_text(text, ".param")
+    save_text(get_param_download_text(params), ".param")
 
 }
 
@@ -2760,15 +3708,15 @@ function save_changed_parameters() {
         return
     }
 
-    let text = ""
+    let changed = {}
     for (const [name, value] of Object.entries(params)) {
         if ((name in defaults) && (value == defaults[name])) {
             continue
         }
-        text += name + "," + value + "\n";
+        changed[name] = value
     }
 
-    save_text(text, "_changed.param")
+    save_text(get_param_download_text(changed), "_changed.param")
 
 }
 
@@ -2783,7 +3731,15 @@ function save_minimal_parameters() {
     let skip_params = []
 
     // Never save stats
-    skip_params.push("STAT_BOOTCNT", "STAT_FLTTIME", "STAT_RUNTIME", "STAT_RESET", "SYS_NUM_RESETS")
+    skip_params.push(
+        "STAT_BOOTCNT",
+        "STAT_FLTTIME",
+        "STAT_RUNTIME",
+        "STAT_RESET",
+        "STAT_FLTCNT",
+        "STAT_DISTFLWN",
+        "SYS_NUM_RESETS"
+    )
 
     // Some read only params that should never be changed
     skip_params.push("FORMAT_VERSION", "MIS_TOTAL", "FENCE_TOTAL", "RALLY_TOTAL")
@@ -2795,7 +3751,7 @@ function save_minimal_parameters() {
         }
     }
 
-    let text = ""
+    let minimal = {}
     for (const [name, value] of Object.entries(params)) {
         if (changed && (name in defaults) && (value == defaults[name])) {
             continue
@@ -2803,10 +3759,10 @@ function save_minimal_parameters() {
         if (skip_params.includes(name)) {
             continue
         }
-        text += name + "," + value + "\n";
+        minimal[name] = value
     }
 
-    save_text(text, "_minimal.param")
+    save_text(get_param_download_text(minimal), "_minimal.param")
 
 }
 

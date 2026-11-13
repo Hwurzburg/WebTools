@@ -2,15 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>ArduPilot PID Review Tool</title>
-<script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
-<script src="https://unpkg.com/browser-cjs/require.min.js"></script>
+<title>ArduPilot PID Review</title>
+<link rel="icon" href="../images/AP_favicon.png">
+<script src='../modules/plotly.js/dist/plotly.min.js'></script>
+<script src='../modules/fft.js/dist/fft.js'></script>
 <script type="text/javascript" src="PIDReview.js"></script>
 <script type="text/javascript" src="../Libraries/Array_Math.js"></script>
 <script type="text/javascript" src="../Libraries/fft.js"></script>
 <script type="text/javascript" src="../Libraries/OpenIn.js"></script>
 <script type="text/javascript" src="../Libraries/LoadingOverlay.js"></script>
 <script type="text/javascript" src="../Libraries/Plotly_helpers.js"></script>
+<script type="text/javascript" src="../Libraries/LogHelpers.js"></script>
+
+<script src="../modules/build/floating-ui/dist/umd/popper.min.js"></script>
+<script src="../modules/build/tippyjs/dist/tippy-bundle.umd.min.js"></script>
 
 </head>
 <table style="width:1200px"><tr><td>
@@ -26,6 +31,11 @@
 </td></tr></table>
 
 <body>
+
+<p style="width:1150px; text-align:justify; padding-left:30px; margin-block-start: 0; margin-block-end: 0.5em;">
+This tool takes a .bin log with RATE or PID messages and shows the time and frequency content of the rate controller target, response and output. To record the full set of PID components the <b>PID</b> bit of the <code>LOG_BITMASK</code> parameter must be set before flying. The <code>RATE</code> log message is enabled by default and can also be used by this tool. Here are <a href="https://github.com/ArduPilot/WebTools/blob/main/PIDReview/Readme.md">more details about this tool and how to use it</a>.
+</p>
+
 
 <style>
     div.plotly-notifier {
@@ -48,7 +58,7 @@
                         <label for="FFTWindow_size">Window size</label>
                     </td>
                     <td>
-                        <input id="FFTWindow_size" name="FFTWindow_size" type="number" min="1" step="1" value="512" onchange="window_size_inc(event); clear_calculation()" style="width:50px"/>
+                        <input id="FFTWindow_size" name="FFTWindow_size" type="number" min="1" step="1" value="512" onchange="fft_window_size_inc(event); clear_calculation()" style="width:50px"/>
                     </td>
                 </table>
             </fieldset>
@@ -63,7 +73,7 @@
             </fieldset>
         </td>
         <td>
-            <fieldset style="width:300px;height:80px">
+            <fieldset style="width:310px;height:80px">
                 <legend>Axis</legend>
                 <table>
                     <td>
@@ -90,13 +100,20 @@
                         <input type="radio" id="type_PIQY" name="Axis" onchange="loading_call(setup_axis)">
                         <label for="type_PIQY">PIQY</label><br>
                     </td>
+                    <td>
+                        <input type="radio" id="type_PIDS" name="Axis" onchange="loading_call(setup_axis)">
+                        <label for="type_PIDS">PIDS</label><br>
+                        <input type="radio" id="type_PIDA" name="Axis" onchange="loading_call(setup_axis)">
+                        <label for="type_PIDA">PIDA</label><br>
+                    </td>
                 </table>
             </fieldset>
         </td>
         <td style="width: 10px;"></td>
         <td>
             <input id="fileItem" type="file" accept=".bin" onchange="readFile(this)"><br><br>
-            <div id="OpenIn"></div><br><br>
+            <input id="OpenIn" type="button" value="Open In" disabled>
+            <br><br>
             <input type="button" id="calculate" value="Calculate" onclick="loading_call(re_calc)">
         </td>
     </table>
@@ -106,30 +123,50 @@
 </table>
 
 <table><tr><td style="width:1200px">
-    <h2 style="text-align:center">Flight Data</h2>
+    <h2 style="text-align:center">
+        Flight Data
+        <img id="PID_TT_FlightData" src="../images/question-circle.svg" style="width: 1em; vertical-align: bottom"
+            data-tippy-content='Zoom into a section of the flight to change the Analysis time then click "Calculate".'
+            data-tippy-maxWidth="750px" />
+    </h2>
+
 </td></tr></table>
 
 <div id="FlightData" style="width:1200px;height:450px"></div>
 
 <table><tr><td style="width:1200px">
-    <h2 style="text-align:center">Time domain</h2>
+    <h2 style="text-align:center">
+        Time domain
+        <img id="TT_PID_TimeDomain" src="../images/question-circle.svg" style="width: 1em; vertical-align: bottom"
+            data-tippy-content="
+    Shows PID inputs and outputs in the time domain.
+    Useful for inspecting tracking error, overshoot, and oscillations.
+    " />
+    </h2>
+
 </td></tr></table>
 
 <div id="TimeInputs" style="width:1200px;height:450px"></div>
 <div id="TimeOutputs" style="width:1200px;height:450px"></div>
 
 <table><tr><td style="width:1200px">
-    <h2 style="text-align:center">Frequency domain</h2>
+    <h2 style="text-align:center">
+        Frequency domain
+        <img id="TT_PID_FrequencyDomain" src="../images/question-circle.svg" style="width: 1em; vertical-align: bottom"
+            data-tippy-content="
+    Displays the frequency response of PID components.
+    Helps identify resonances, noise amplification, and D-term behavior.
+    " />
+    </h2>
+
+
 </td></tr></table>
 
-<table>
-    <tr>
-        <td style="width: 50px;"></td>
-        <td>
-            <fieldset style="width:300px">
+<div style="width:1145px; display: flex; flex-direction:row; margin-left:30px">
+            <fieldset>
                 <legend>PID</legend>
                 <p>
-                    <fieldset style="width:300px">
+                    <fieldset style="width:215px">
                         <legend ondblclick="update_hidden(this)">Inputs</legend>
                         <input type="checkbox" id="PIDX_Tar" onchange="update_hidden(this)">
                         <label for="PIDX_Tar">Target</label>
@@ -142,7 +179,7 @@
                     </fieldset>
                 </p>
                 <p>
-                    <fieldset style="width:300px">
+                    <fieldset style="width:215px">
                         <legend ondblclick="update_hidden(this)">Components</legend>
                         <input type="checkbox" id="PIDX_P" onchange="update_hidden(this)">
                         <label for="PIDX_P">P</label>
@@ -155,26 +192,25 @@
 
                         <input type="checkbox" id="PIDX_FF" onchange="update_hidden(this)">
                         <label for="PIDX_FF">FF</label>
+
+                        <input type="checkbox" id="PIDX_DFF" onchange="update_hidden(this)">
+                        <label for="PIDX_DFF">D FF</label>
                     </fieldset>
                 </p>
                 <p>
-                    <fieldset style="width:300px">
+                    <fieldset style="width:215px">
                         <legend ondblclick="update_hidden(this)">Output</legend>
                         <input type="checkbox" id="PIDX_Out" onchange="update_hidden(this)">
-                        <label for="PIDX_Out">PID + FF</label>
+                        <label for="PIDX_Out">PID + FF + D FF</label>
                     </fieldset>
                 </p>
                 Logging rate: <label id="FFT_infoA"></label> Hz<br><br>
                 Frequency resolution: <label id="FFT_infoB"></label> Hz
              </fieldset>
-        </td>
-        <td>
-            <fieldset style="width:600px; min-height:300px" id="test_sets">
+            <fieldset style="min-height:300px; flex: 1;" id="test_sets">
                 <legend>Tests</legend>
             </fieldset>
-        </td>
-    </tr>
-</table>
+        </div>
 
 <div id="FFTPlot" style="width:1200px;height:450px"></div>
 
@@ -208,13 +244,31 @@
 </table>
 
 <table><tr><td style="width:1200px">
-    <h2 style="text-align:center">Step Response</h2>
+    <h2 style="text-align:center">
+        Step Response
+        <img id="TT_PID_StepResponse" src="../images/question-circle.svg" style="width: 1em; vertical-align: bottom"
+            data-tippy-content="
+    Simulated PID response to a step input.
+    Used to evaluate rise time, overshoot, damping, and stability.
+    " />
+    </h2>
+
+
 </td></tr></table>
 
 <div id="step_plot" style="width:1200px;height:450px"></div>
 
 <table><tr><td style="width:1200px">
-    <h2 style="text-align:center">PID Spectrogram</h2>
+    <h2 style="text-align:center">
+        PID Spectrogram
+        <img id="TT_PID_Spectrogram" src="../images/question-circle.svg" style="width: 1em; vertical-align: bottom"
+            data-tippy-content="
+    Time-frequency view of PID output.
+    Shows how control effort and noise vary throughout the flight.
+    " />
+    </h2>
+
+
 </td></tr></table>
 
 <div id="Spectrogram" style="width:1200px;height:450px"></div>
@@ -222,7 +276,7 @@
 <table>
     <td style="width: 375px;"></td>
     <td>
-        <fieldset style="width:450px;height:40px">
+        <fieldset style="width:500px;height:40px">
             <legend>PID component</legend>
             <input type="radio" id="Spec_Tar" name="Spec" onchange="redraw_Spectrogram()">
             <label for="Spec_Tar">Target</label>
@@ -245,6 +299,9 @@
             <input type="radio" id="Spec_FF" name="Spec" onchange="redraw_Spectrogram()">
             <label for="Spec_FF">FF</label>
 
+            <input type="radio" id="Spec_DFF" name="Spec" onchange="redraw_Spectrogram()">
+            <label for="Spec_DFF">D FF</label>
+
             <input type="radio" id="Spec_Out" name="Spec" onchange="redraw_Spectrogram()">
             <label for="Spec_Out">Output</label>
         </fieldset>
@@ -265,6 +322,17 @@
               'Line Number: '+ linenumber)
         return false
     }
+    window.addEventListener('unhandledrejection', function (e) {
+        throw new Error(e.reason.stack)
+    })
+
+    tippy('#PID_TT_FlightData')
+    tippy('#TT_PID_FlightData');
+    tippy('#TT_PID_TimeDomain');
+    tippy('#TT_PID_FrequencyDomain');
+    tippy('#TT_PID_StepResponse');
+    tippy('#TT_PID_Spectrogram');
+
 
     setup_plots()
     reset()
@@ -276,12 +344,15 @@
         }
         let reader = new FileReader()
         reader.onload = function (e) {
-            loading_call(() => { load(reader.result) })
+            loading_call( async () => { 
+                await load(reader.result)
+                document.title = "PID Review: " + file.name
+            })
         }
         reader.readAsArrayBuffer(file)
     }
 
-    setup_open_in("OpenIn", "fileItem", function (data) { loading_call(() => { load(data) }) })
+    const open_in_update = setup_open_in("OpenIn", "fileItem", function (data) { loading_call(() => { load(data) }) })
 
     init_loading_overlay()
 

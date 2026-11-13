@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>ArduPilot Hardware Checker</title>
+<title>ArduPilot Hardware Report</title>
+<link rel="icon" href="../images/AP_favicon.png">
 <script type="text/javascript" src="HardwareReport.js"></script>
 <script type="text/javascript" src="../Libraries/DecodeDevID.js"></script>
 <script type="text/javascript" src="../Libraries/FileSaver.js"></script>
@@ -10,8 +11,12 @@
 <script type="text/javascript" src="../Libraries/OpenIn.js"></script>
 <script type="text/javascript" src="../Libraries/LoadingOverlay.js"></script>
 <script type="text/javascript" src="../Libraries/Param_Helpers.js"></script>
+<script type="text/javascript" src="../Libraries/LogHelpers.js"></script>
 
-<script src='https://cdn.plot.ly/plotly-2.20.0.min.js'></script>
+<script src='../modules/plotly.js/dist/plotly.min.js'></script>
+
+<script src="../modules/build/floating-ui/dist/umd/popper.min.js"></script>
+<script src="../modules/build/tippyjs/dist/tippy-bundle.umd.min.js"></script>
 
 </head>
 <table style="width:1200px"><tr><td>
@@ -30,10 +35,12 @@
 
 <h1><a href="" style="color: #000000; text-decoration:none;">ArduPilot Hardware Report</a></h1>
 
-<body onload="initial_load(); reset();">
-<input id="fileItem" type="file" accept=".param,.parm,.bin" onchange="load(this)">
+<input id="fileItem" type="file" accept=".param,.parm,.bin" onchange="load()">
 
-<div id="OpenIn"></div>
+<input id="OpenIn" type="button" value="Open In" disabled>
+
+<h3 hidden>Warnings</h3>
+<p id="warnings"></p>
 
 <h3 hidden>Firmware</h3>
 <p id="VER"></p>
@@ -58,6 +65,9 @@
 
 <h3 hidden>Barometers</h3>
 <p id="BARO"></p>
+
+<h3 hidden>GPS</h3>
+<p id="GPS"></p>
 
 <h3 hidden>Airspeed Sensors</h3>
 <p id="ARSPD"></p>
@@ -189,25 +199,25 @@
       <fieldset style="width:600px">
         <legend>Stream rates</legend>
         <input type="checkbox" id="param_stream_0">
-        <label for="param_stream_0">SR 0,</label>
+        <label for="param_stream_0">MAV 1,</label>
 
         <input type="checkbox" id="param_stream_1">
-        <label for="param_stream_1">SR 1,</label>
+        <label for="param_stream_1">MAV 2,</label>
 
         <input type="checkbox" id="param_stream_2">
-        <label for="param_stream_2">SR 2,</label>
+        <label for="param_stream_2">MAV 3,</label>
 
         <input type="checkbox" id="param_stream_3">
-        <label for="param_stream_3">SR 3,</label>
+        <label for="param_stream_3">MAV 4,</label>
 
         <input type="checkbox" id="param_stream_4">
-        <label for="param_stream_4">SR 4,</label>
+        <label for="param_stream_4">MAV 5,</label>
 
         <input type="checkbox" id="param_stream_5">
-        <label for="param_stream_5">SR 5,</label>
+        <label for="param_stream_5">MAV 6,</label>
 
         <input type="checkbox" id="param_stream_6">
-        <label for="param_stream_6">SR 6</label>
+        <label for="param_stream_6">MAV 7</label>
       </fieldset>
     </form>
 
@@ -239,6 +249,11 @@
   <div id="Board_Voltage" style="width:800px;height:400px"></div>
 </div>
 
+<div hidden>
+  <h3>Power flags</h3>
+  <div id="power_flags" style="width:800px;height:400px"></div>
+</div>
+
 <h3 id="CPU" hidden>CPU</h3>
 <div hidden>
   <h4>Load</h4>
@@ -254,6 +269,9 @@
   <h4>Loop times</h4>
   <div id="performance_time" style="width:800px;height:400px"></div>
 </div>
+
+<h3 hidden>Data Rates</h3>
+<p id="DataRates"></p>
 
 <h3 id="Stack" hidden>Stack</h3>
 <div hidden>
@@ -283,6 +301,11 @@
   <div id="log_stats" style="width:800px;height:800px"></div>
 </div>
 
+<div hidden>
+  <h3>Clock drift</h3>
+  <div id="clock_drift" style="width:800px;height:400px"></div>
+</div>
+
 <script>
 
   window.onerror = function(msg, url, linenumber) {
@@ -295,8 +318,11 @@
             'Line Number: '+ linenumber)
       return false
   }
+  window.addEventListener('unhandledrejection', function (e) {
+    throw new Error(e.reason.stack)
+  })
 
-  setup_open_in("OpenIn", "fileItem", function (data) { loading_call(() => { reset(); load_log(data) }) })
+  const open_in_update = setup_open_in("OpenIn", "fileItem", function (data) { loading_call(async () => { load_log(data) }) }, async () => { await Promise.allSettled(import_done) }, "right")
 
   init_loading_overlay()
 

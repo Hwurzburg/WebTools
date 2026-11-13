@@ -14,7 +14,7 @@ const bus =     (ID>>3) & 0x1F
 const address = (ID>>8) & 0xFF
 const devtype = (ID>>16)
 
-bustypes = {
+let bustypes = {
     1: "I2C",
     2: "SPI",
     3: "DRONECAN",
@@ -23,7 +23,7 @@ bustypes = {
     6: "SERIAL",
 }
 
-compass_types = {
+let compass_types = {
     0x01 : "HMC5883_OLD",
     0x07 : "HMC5883",
     0x02 : "LSM303D",
@@ -43,9 +43,14 @@ compass_types = {
     0x12 : "RM3100",
     0x13 : "MMC5883",
     0x14 : "AK09918",
+    0x15 : "AK09915",
+    0x16 : "QMC5883P",
+    0x17 : "BMM350",
+    0x18 : "IIS2MDC",
+    0x19 : "LIS2MDL",
 }
 
-imu_types = {
+let imu_types = {
     0x09 : "BMI160",
     0x10 : "L3G4200D",
     0x11 : "ACC_LSM303D",
@@ -79,9 +84,13 @@ imu_types = {
     0x39 : "BMI085",
     0x3A : "ICM42670",
     0x3B : "ICM45686",
+    0x3C : "SCHA63T",
+    0x3D : "IIM42653",
+    0x3E : "LSM6DSV",
+    0x3F : "ASM330",
 }
 
-baro_types = {
+let baro_types = {
     0x01 : "SITL",
     0x02 : "BMP085",
     0x03 : "BMP280",
@@ -99,12 +108,16 @@ baro_types = {
     0x0F : "ICP101XX",
     0x10 : "ICP201XX",
     0x11 : "MS5607",
-    0x12 : "MS5837",
+    0x12 : "MS5837_30BA",
     0x13 : "MS5637",
     0x14 : "BMP390",
+    0x15 : "BMP581",
+    0x16 : "SPA06",
+    0x17 : "AUAV",
+    0x18 : "MS5837_02BA",
 }
 
-airspeed_types = {
+let airspeed_types = {
     0x01 : "SITL",
     0x02 : "MS4525",
     0x03 : "MS5525",
@@ -115,6 +128,7 @@ airspeed_types = {
     0x08 : "ANALOG",
     0x09 : "NMEA",
     0x0A : "ASP5033",
+    0x0B : "AUAV",
 }
 
 function get(lookup, index) {

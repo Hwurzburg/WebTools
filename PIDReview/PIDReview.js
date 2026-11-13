@@ -1,15 +1,10 @@
 // A js tool for plotting ArduPilot PID log data
 
-// Use browser-cjs to load fft lib
-// https://github.com/indutny/fft.js
-// Much faster than math.fft!
-const FFT_lib = require("https://unpkg.com/fft.js@4.0.4/lib/fft.js")
-
 var DataflashParser
-import('../JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default });
+const import_done = import('../modules/JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default });
 
 // Keys in data object to run FFT of
-const fft_keys = ["Tar", "Act", "Err", "P", "I", "D", "FF", "Out"]
+const fft_keys = ["Tar", "Act", "Err", "P", "I", "D", "FF", "DFF", "Out"]
 
 function run_batch_fft(data_set) {
 
@@ -31,7 +26,7 @@ function run_batch_fft(data_set) {
     const window_correction = window_correction_factors(windowing_function)
 
     // FFT library
-    const fft = new FFT_lib(window_size);
+    const fft = new FFTJS(window_size);
 
     // Calculate average sample time
     var sample_rate_sum = 0
@@ -69,7 +64,8 @@ function run_batch_fft(data_set) {
                 // Log section is too short, skip
                 continue
             }
-            var ret = run_fft(data_set[j][i], fft_keys, window_size, window_spacing, windowing_function, fft)
+            const valid_keys = fft_keys.filter(key => data_set[j][i][key] != null)
+            var ret = run_fft(data_set[j][i], valid_keys, window_size, window_spacing, windowing_function, fft)
 
             // Initialize arrays
             if (!have_data) {
@@ -81,7 +77,7 @@ function run_batch_fft(data_set) {
             }
 
             data_set[j].FFT.time.push(...array_offset(array_scale(ret.center, sample_time), data_set[j][i].time[0]))
-            for (const key of fft_keys) {
+            for (const key of valid_keys) {
                 data_set[j].FFT[key].push(...ret[key])
             }
         }
@@ -107,9 +103,12 @@ function get_axis_index() {
 // Attempt to put page back to for a new log
 function reset() {
 
+    document.title = "ArduPilot PID Review"
+
     const types = ["PIDP",   "PIDR",   "PIDY",
                    "PIQP",   "PIQR",   "PIQY",
-                   "RATE_R", "RATE_P", "RATE_Y"]
+                   "RATE_R", "RATE_P", "RATE_Y",
+                   "PIDS", "PIDA"]
     for (const type of types) {
         let ele = document.getElementById("type_" + type)
         ele.disabled = true
@@ -269,12 +268,12 @@ function setup_plots() {
                                 xaxis: { title: {text: time_scale_label } },
                                 yaxis: { title: {text: "deg / s" } }}
 
-    var plot = document.getElementById("TimeInputs")
+    plot = document.getElementById("TimeInputs")
     Plotly.purge(plot)
     Plotly.newPlot(plot, TimeInputs.data, TimeInputs.layout, {displaylogo: false})
 
 
-    const pid_outputs = ["P","I","D","FF","Output"]
+    const pid_outputs = ["P","I","D","FF","D FF","Output"]
     TimeOutputs.data = []
     for (const item of pid_outputs) {
         TimeOutputs.data.push({ mode: "lines",
@@ -390,7 +389,7 @@ function link_plots() {
 }
 
 // Add data sets to FFT plot
-const plot_types = ["Target", "Actual", "Error", "P", "I", "D", "FF", "Output"]
+const plot_types = ["Target", "Actual", "Error", "P", "I", "D", "FF", "D FF", "Output"]
 function get_FFT_data_index(set_num, plot_type) {
     return set_num*plot_types.length + plot_type
 }
@@ -539,61 +538,19 @@ function calculate() {
 
 // Get configured amplitude scale
 function get_amplitude_scale() {
+    const use_DB = document.getElementById("ScaleLog").checked
+    const use_PSD = document.getElementById("ScalePSD").checked
 
-    const use_DB = document.getElementById("ScaleLog").checked;
-    const use_PSD = document.getElementById("ScalePSD").checked;
-
-    var ret = {}
-    if (use_PSD) {
-        ret.fun = function (x) { return array_mul(x,x) } // x.^2
-        ret.scale = function (x) { return array_scale(array_log10(x), 10.0) } // 10 * log10(x)
-        ret.label = "PSD (dB/Hz)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} dB/Hz" }
-        ret.window_correction = function(correction, resolution) { return ((correction.energy**2) * 0.5) / resolution }
-        ret.quantization_correction = function(correction) { return 1 / (correction.energy * Math.SQRT1_2) }
-
-    } else if (use_DB) {
-        ret.fun = function (x) { return x }
-        ret.scale = function (x) { return array_scale(array_log10(x), 20.0) } // 20 * log10(x)
-        ret.label = "Amplitude (dB)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} dB" }
-        ret.correction_scale = 1.0
-        ret.window_correction = function(correction, resolution) { return correction.linear }
-        ret.quantization_correction = function(correction) { return 1 / correction.linear }
-
-    } else {
-        ret.fun = function (x) { return x }
-        ret.scale = function (x) { return x }
-        ret.label = "Amplitude"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f}" }
-        ret.window_correction = function(correction, resolution) { return correction.linear }
-        ret.quantization_correction = function(correction) { return 1 / correction.linear }
-
-    }
-
-    return ret
+    return fft_amplitude_scale(use_DB, use_PSD)
 }
+
 
 // Get configured frequency scale object
 function get_frequency_scale() {
+    const use_RPM = document.getElementById("freq_Scale_RPM").checked
+    const log_scale = document.getElementById("freq_ScaleLog").checked
 
-    const use_RPM = document.getElementById("freq_Scale_RPM").checked;
-
-    var ret = {}
-    if (use_RPM) {
-        ret.fun = function (x) { return array_scale(x, 60.0) }
-        ret.label = "RPM"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} RPM" }
-
-    } else {
-        ret.fun = function (x) { return x }
-        ret.label = "Frequency (Hz)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} Hz" }
-    }
-
-    ret.type = document.getElementById("freq_ScaleLog").checked ? "log" : "linear"
-
-    return ret
+    return fft_frequency_scale(use_RPM, log_scale)
 }
 
 // Look through time array and return first index before start time
@@ -601,7 +558,7 @@ function find_start_index(time) {
     const start_time = parseFloat(document.getElementById("TimeStart").value)
 
     var start_index = 0
-    for (j = 0; j<time.length; j++) {
+    for (let j = 0; j<time.length; j++) {
         // Move forward start index while time is less than start time
         if (time[j] < start_time) {
             start_index = j
@@ -615,7 +572,7 @@ function find_end_index(time) {
     const end_time = parseFloat(document.getElementById("TimeEnd").value)
 
     var end_index = 0
-    for (j = 0; j<time.length-1; j++) {
+    for (let j = 0; j<time.length-1; j++) {
         // Move forward end index while time is less than end time
         if (time[j] <= end_time) {
             end_index = j + 1
@@ -662,13 +619,13 @@ function add_param_sets() {
     set_cell_style(item)
 
     const names = get_PID_param_names(PID.params.prefix)
-    for (const [name, param_string] of Object.entries(names)) {
+    for (const [name, param] of Object.entries(names)) {
         let item = document.createElement("th")
         header.appendChild(item)
         set_cell_style(item)
 
-        item.appendChild(document.createTextNode(name.replace("_", " ")))
-        item.setAttribute('title', param_string)
+        item.appendChild(document.createTextNode(param.title))
+        item.setAttribute('title', param.name)
     }
 
     // Add line for each param set
@@ -711,21 +668,21 @@ function add_param_sets() {
         checkbox.disabled = (valid_sets == 1) || !valid
         item.appendChild(checkbox)
 
-        for (const name of Object.keys(names)) {
+        for (const [key, param] of Object.entries(names)) {
             let item = document.createElement("td")
             row.appendChild(item)
             set_cell_style(item, color)
 
-            const value = set[name]
+            const value = set[key]
             if (value == null) {
                 continue
             }
 
-            const text = document.createTextNode(value.toFixed(4))
+            const text = document.createTextNode(value.toFixed(param.decimalPlaces))
 
             let changed = false
             if (i > 0) {
-                const last_value = PID.params.sets[i-1][name]
+                const last_value = PID.params.sets[i-1][key]
                 if (value != last_value) {
                     changed = true
                 }
@@ -768,6 +725,11 @@ function add_param_sets() {
     document.getElementById("Spec_D").disabled = !have_all
     document.getElementById("Spec_FF").disabled = !have_all
 
+    // DFF is only available in newer firmware logs
+    const have_DFF = have_all && PID.sets.some(set => set != null && set.some(batch => batch.DFF != null))
+    document.getElementById("PIDX_DFF").disabled = !have_DFF
+    document.getElementById("Spec_DFF").disabled = !have_DFF
+
     // Uncheck any that are disabled
     if (!have_all) {
         document.getElementById("PIDX_Err").checked = false
@@ -775,17 +737,20 @@ function add_param_sets() {
         document.getElementById("PIDX_I").checked = false
         document.getElementById("PIDX_D").checked = false
         document.getElementById("PIDX_FF").checked = false
+    }
+    if (!have_DFF) {
+        document.getElementById("PIDX_DFF").checked = false
+    }
 
-        // Change to Out on spectrogram if disabled option is set
-        const disabled_checked = document.getElementById("Spec_Err").checked ||
-                                 document.getElementById("Spec_P").checked ||
-                                 document.getElementById("Spec_I").checked ||
-                                 document.getElementById("Spec_D").checked ||
-                                 document.getElementById("Spec_FF").checked
-        if (disabled_checked) {
-            document.getElementById("Spec_Out").checked = true
-        }
-    
+    // Change to Out on spectrogram if disabled option is set
+    const disabled_checked = document.getElementById("Spec_Err").checked ||
+                             document.getElementById("Spec_P").checked ||
+                             document.getElementById("Spec_I").checked ||
+                             document.getElementById("Spec_D").checked ||
+                             document.getElementById("Spec_FF").checked ||
+                             document.getElementById("Spec_DFF").checked
+    if ((!have_all || !have_DFF) && disabled_checked) {
+        document.getElementById("Spec_Out").checked = true
     }
 
 
@@ -850,12 +815,17 @@ function redraw() {
             if ("FF" in set[i]) {
                 TimeOutputs.data[3].y = TimeOutputs.data[3].y.concat(set[i].FF)
             }
-            TimeOutputs.data[4].y = TimeOutputs.data[4].y.concat(set[i].Out)
+            if (set[i].DFF != null) {
+                TimeOutputs.data[4].y = TimeOutputs.data[4].y.concat(set[i].DFF)
+            }
+            TimeOutputs.data[5].y = TimeOutputs.data[5].y.concat(set[i].Out)
         }
     }
 
     // Set X axis to selected time range
     const time_range = [ parseFloat(document.getElementById("TimeStart").value), parseFloat(document.getElementById("TimeEnd").value) ]
+
+    TimeInputs.layout.yaxis.title.text = PID.units
 
     TimeInputs.layout.xaxis.autorange = false
     TimeInputs.layout.xaxis.range = time_range
@@ -866,8 +836,8 @@ function redraw() {
     // Rectangles to show param changes
     if (PID.params.sets.length > 1) {
         for (let i = 0; i < PID.params.sets.length; i++) {
-            const set_start = Math.max(time_range[0], PID.params.sets[i].start_time)
-            const set_end = Math.min(time_range[1], PID.params.sets[i].end_time)
+            const set_start = Math.max(PID_log_messages.start_time, PID.params.sets[i].start_time)
+            const set_end = Math.min(PID_log_messages.end_time, PID.params.sets[i].end_time)
 
             TimeInputs.layout.shapes[i].x0 = set_start
             TimeInputs.layout.shapes[i].x1 = set_end
@@ -1041,7 +1011,7 @@ function redraw_Spectrogram() {
         // Setup z data
         const len = skip_flag.length
         let index = 0
-        for (j = 0; j<len; j++) {
+        for (let j = 0; j<len; j++) {
             if (skip_flag[j] == true) {
                 // Add null Z values, this results in a blank section in the plot
                 Spectrogram.data[0].z.push(new Array(num_bins))
@@ -1086,7 +1056,7 @@ function redraw_step() {
     // FFT library, use window size and sample rate from original FFT
     const window_size = PID.sets.FFT.window_size
     const real_len = real_length(window_size)
-    const fft = new FFT_lib(window_size);
+    const fft = new FFTJS(window_size);
     var transfer_function = fft.createComplexArray()
     var impulse_response = fft.createComplexArray()
 
@@ -1246,7 +1216,7 @@ function update_hidden(source) {
         var index
         for (let j = 0; j < fft_keys.length; j++) {
             const key = fft_keys[j]
-            if (id.endsWith(key)) {
+            if (id.endsWith("_" + key)) {
                 index = j
                 break
             }
@@ -1337,49 +1307,69 @@ function time_range_changed() {
     document.getElementById('calculate').disabled = false
 }
 
-var last_window_size
-function window_size_inc(event) {
-    if (last_window_size == null) {
-        last_window_size = parseFloat(event.target.defaultValue)
-    }
-    const new_value = parseFloat(event.target.value)
-    const change = parseFloat(event.target.value) - last_window_size
-    if (Math.abs(change) != 1) {
-        // Assume a change of one is comming from the up down buttons, ignore angthing else
-        last_window_size = new_value
-        return
-    }
-    var new_exponent = Math.log2(last_window_size)
-    if (!Number.isInteger(new_exponent)) {
-        // Move to power of two in the selected direction
-        new_exponent = Math.floor(new_exponent)
-        if (change > 0) {
-            new_exponent += 1
-        }
-
-    } else if (change > 0) {
-        // Move up one
-        new_exponent += 1
-
-    } else {
-        // Move down one
-        new_exponent -= 1
-
-    }
-    event.target.value = 2**new_exponent
-    last_window_size = event.target.value
-}
-
 function get_PID_param_names(prefix) {
-    return { KP:            prefix + "P",
-             KI:            prefix + "I",
-             KD:            prefix + "D",
-             FF:            prefix + "FF",
-             I_max:         prefix + "IMAX",
-             Target_filter: prefix + "FLTT",
-             Error_filter:  prefix + "FLTE",
-             D_filter:      prefix + "FLTD",
-             Slew_max:      prefix + "SMAX"}
+    return { 
+        KP: {
+            title: "KP",
+            name: prefix + "P",
+            decimalPlaces: 4,
+        },
+        KI: {
+            title: "KI",
+            name: prefix + "I",
+            decimalPlaces: 4,
+        },
+        KD: {
+            title: "KD",
+            name: prefix + "D",
+            decimalPlaces: 4,
+        },
+        FF: {
+            title: "KFF",
+            name: prefix + "FF",
+            decimalPlaces: 4,
+        },
+        D_FF: {
+            title: "KDFF",
+            name: prefix + "D_FF",
+            decimalPlaces: 4,
+        },
+        I_max: {
+            title: "I Max",
+            name: prefix + "IMAX",
+            decimalPlaces: 4,
+        },
+        Target_filter: {
+            title: "Target Filter (Hz)",
+            name: prefix + "FLTT",
+            decimalPlaces: 4,
+        },
+        Notch_target: {
+            title: "Target Notch Index",
+            name: prefix + "NTF",
+            decimalPlaces: 0,
+        },
+        Error_filter: {
+            title: "Error Filter (Hz)",
+            name: prefix + "FLTE",
+            decimalPlaces: 4,
+        },
+        Notch_error: {
+            title: "Error Notch Index",
+            name: prefix + "NEF",
+            decimalPlaces: 0,
+        },
+        D_filter: {
+            title: "D Filter (Hz)",
+            name: prefix + "FLTD",
+            decimalPlaces: 4,
+        },
+        Slew_max: {
+            title: "Slew Max",
+            name: prefix + "SMAX",
+            decimalPlaces: 4,
+        }
+    }
 }
 
 // Split use the given time array to return split points in log data
@@ -1444,23 +1434,66 @@ function split_into_batches(PID_log_messages, index, time) {
 }
 
 var PID_log_messages = []
-function load(log_file) {
+async function load(log_file) {
+
+    // Make sure imports are fully loaded before starting
+    // This is needed when called from "open in"
+    await import_done
 
     const start = performance.now()
 
     // Reset buttons and labels
     reset()
 
-    // Reset log object                                  Copter          Plane
-    PID_log_messages = [ {id: ["PIDR"],      prefixes: [ "ATC_RAT_RLL_", "RLL_RATE_"]},
-                         {id: ["PIDP"],      prefixes: [ "ATC_RAT_PIT_", "PTCH_RATE_"]},
-                         {id: ["PIDY"],      prefixes: [ "ATC_RAT_YAW_", "YAW_RATE_"]},
-                         {id: ["PIQR"],      prefixes: [                 "Q_A_RAT_RLL_"]},
-                         {id: ["PIQP"],      prefixes: [                 "Q_A_RAT_PIT_"]},
-                         {id: ["PIQY"],      prefixes: [                 "Q_A_RAT_YAW_"]},
-                         {id: ["RATE", "R"], prefixes: [ "ATC_RAT_RLL_", "Q_A_RAT_RLL_"]},
-                         {id: ["RATE", "P"], prefixes: [ "ATC_RAT_PIT_", "Q_A_RAT_PIT_"]},
-                         {id: ["RATE", "Y"], prefixes: [ "ATC_RAT_YAW_", "Q_A_RAT_YAW_"]} ]
+    let log = new DataflashParser()
+    log.processData(log_file , [])
+
+    open_in_update(log)
+
+    // Get vehicle type
+    const { build_type } = get_version_and_board(log)
+
+    // Get PID object avalavle for vehicle type
+    const rad2deg = 180.0 / Math.PI
+    const degUnits = "deg /s"
+    switch (build_type) {
+        case 1: // Rover
+            PID_log_messages = [
+                {id: ["PIDS"], prefixes: ["ATC_STR_RAT_"], unitScale: rad2deg, units: degUnits },
+                {id: ["PIDA"], prefixes: ["ATC_SPEED_"],   unitScale: 1.0,     units: "m / s" }
+            ]
+            break
+
+        case 2: // Copter
+            PID_log_messages = [
+                {id: ["PIDR"],      prefixes: ["ATC_RAT_RLL_"], unitScale: rad2deg, units: degUnits },
+                {id: ["PIDP"],      prefixes: ["ATC_RAT_PIT_"], unitScale: rad2deg, units: degUnits },
+                {id: ["PIDY"],      prefixes: ["ATC_RAT_YAW_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "R"], prefixes: ["ATC_RAT_RLL_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "P"], prefixes: ["ATC_RAT_PIT_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "Y"], prefixes: ["ATC_RAT_YAW_"], unitScale: rad2deg, units: degUnits }
+            ]
+            break
+
+        case 3: // Plane
+            PID_log_messages = [
+                {id: ["PIDR"],      prefixes: ["RLL_RATE_"],    unitScale: 1.0,     units: degUnits },
+                {id: ["PIDP"],      prefixes: ["PTCH_RATE_"],   unitScale: 1.0,     units: degUnits },
+                {id: ["PIDY"],      prefixes: ["YAW_RATE_"],    unitScale: 1.0,     units: degUnits },
+                {id: ["PIQR"],      prefixes: ["Q_A_RAT_RLL_"], unitScale: rad2deg, units: degUnits },
+                {id: ["PIQP"],      prefixes: ["Q_A_RAT_PIT_"], unitScale: rad2deg, units: degUnits },
+                {id: ["PIQY"],      prefixes: ["Q_A_RAT_YAW_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "R"], prefixes: ["Q_A_RAT_RLL_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "P"], prefixes: ["Q_A_RAT_PIT_"], unitScale: rad2deg, units: degUnits },
+                {id: ["RATE", "Y"], prefixes: ["Q_A_RAT_YAW_"], unitScale: rad2deg, units: degUnits },
+            ]
+            break
+
+        default:
+            alert("Vehicle Type not supported")
+            return
+    }
+
 
     // Set flags for no data
     PID_log_messages.have_data = false
@@ -1468,10 +1501,14 @@ function load(log_file) {
         PID_log_messages[i].have_data = false
     }
 
-    let log = new DataflashParser()
-    log.processData(log_file , ['PARM'])
+    // micro seconds to seconds helpers
+    const US2S = 1 / 1000000
+    function TimeUS_to_seconds(TimeUS) {
+        return array_scale(TimeUS, US2S)
+    }
 
     // Load params, split for any changes
+    const PARM = log.get('PARM')
     for (let i = 0; i < PID_log_messages.length; i++) {
         PID_log_messages[i].params = { prefix: null, sets: [] }
         for (const prefix of PID_log_messages[i].prefixes) {
@@ -1485,16 +1522,16 @@ function load(log_file) {
 
             let found_param = false
             let last_set_end
-            for (let j = 0; j < log.messages.PARM.Name.length; j++) {
-                const param_name = log.messages.PARM.Name[j]
-                for (const [name, param_string] of Object.entries(names)) {
-                    if (param_name !== param_string) {
+            for (let j = 0; j < PARM.Name.length; j++) {
+                const param_name = PARM.Name[j]
+                for (const [key, param] of Object.entries(names)) {
+                    if (param_name !== param.name) {
                         continue
                     }
-                    const time = log.messages.PARM.time_boot_ms[j] / 1000
-                    const value = log.messages.PARM.Value[j]
+                    const time = PARM.TimeUS[j] * US2S
+                    const value = PARM.Value[j]
                     found_param = true
-                    if (param_values[name] != null  && (param_values[name] != value)) {
+                    if (param_values[key] != null  && (param_values[key] != value)) {
                         if ((last_set_end == null) || (time - last_set_end > 1.0)) {
                             // First param change for a second
                             last_set_end = time
@@ -1507,12 +1544,12 @@ function load(log_file) {
 
                         } else {
                             // Very recent param change, combine with latest set, this leaves gap between sets
-                            param_values[name] = value
+                            param_values[key] = value
                             param_values.start_time = time
 
                         }
                     }
-                    param_values[name] = value
+                    param_values[key] = value
                     break
                 }
             }
@@ -1525,9 +1562,6 @@ function load(log_file) {
             }
         }
     }
-
-    // Don't need params any more
-    delete log.messages.PARM
 
     // Load each log msg type
     PID_log_messages.start_time = null
@@ -1542,16 +1576,11 @@ function load(log_file) {
             // Dont have log message
             continue
         }
-        log.parseAtOffset(id)
+        const log_msg = log.get(id)
 
-        const have_msg = Object.keys(log.messages[id]).length > 0
-        if (!have_msg) {
-            // Do have log, but nothing in it
-            continue
-        }
         const is_RATE_msg = id === "RATE"
 
-        const time = array_scale(Array.from(log.messages[id].time_boot_ms), 1/1000)
+        const time = TimeUS_to_seconds(log_msg.TimeUS)
 
         const batches = split_into_batches(PID_log_messages, i, time)
 
@@ -1567,22 +1596,23 @@ function load(log_file) {
                     // Note that is not quite the same, PID logs report the filtered target value where as RATE gets the raw
                     PID_log_messages[i].sets[batch.param_set].push({ time: time.slice(batch.batch_start, batch.batch_end),
                                                                      sample_rate: batch.sample_rate,
-                                                                     Tar: Array.from(log.messages[id][axis_prefix + "Des"].slice(batch.batch_start, batch.batch_end)),
-                                                                     Act: Array.from(log.messages[id][axis_prefix        ].slice(batch.batch_start, batch.batch_end)),
-                                                                     Out: Array.from(log.messages[id][axis_prefix + "Out"].slice(batch.batch_start, batch.batch_end))})
+                                                                     Tar: Array.from(log_msg[axis_prefix + "Des"].slice(batch.batch_start, batch.batch_end)),
+                                                                     Act: Array.from(log_msg[axis_prefix        ].slice(batch.batch_start, batch.batch_end)),
+                                                                     Out: Array.from(log_msg[axis_prefix + "Out"].slice(batch.batch_start, batch.batch_end))})
 
                 } else {
-                    // Convert radians to degress
-                    const rad2deg = 180.0 / Math.PI
+                    // Read in and apply unit scale
                     PID_log_messages[i].sets[batch.param_set].push({ time: time.slice(batch.batch_start, batch.batch_end),
                                                                      sample_rate: batch.sample_rate,
-                                                                     Tar: array_scale(Array.from(log.messages[id].Tar.slice(batch.batch_start, batch.batch_end)), rad2deg),
-                                                                     Act: array_scale(Array.from(log.messages[id].Act.slice(batch.batch_start, batch.batch_end)), rad2deg),
-                                                                     Err: array_scale(Array.from(log.messages[id].Err.slice(batch.batch_start, batch.batch_end)), rad2deg),
-                                                                     P:   Array.from(log.messages[id].P.slice(batch.batch_start, batch.batch_end)),
-                                                                     I:   Array.from(log.messages[id].I.slice(batch.batch_start, batch.batch_end)),
-                                                                     D:   Array.from(log.messages[id].D.slice(batch.batch_start, batch.batch_end)),
-                                                                     FF:  Array.from(log.messages[id].FF.slice(batch.batch_start, batch.batch_end))})
+                                                                     Tar: array_scale(Array.from(log_msg.Tar.slice(batch.batch_start, batch.batch_end)), PID_log_messages[i].unitScale),
+                                                                     Act: array_scale(Array.from(log_msg.Act.slice(batch.batch_start, batch.batch_end)), PID_log_messages[i].unitScale),
+                                                                     Err: array_scale(Array.from(log_msg.Err.slice(batch.batch_start, batch.batch_end)), PID_log_messages[i].unitScale),
+                                                                     P:   Array.from(log_msg.P.slice(batch.batch_start, batch.batch_end)),
+                                                                     I:   Array.from(log_msg.I.slice(batch.batch_start, batch.batch_end)),
+                                                                     D:   Array.from(log_msg.D.slice(batch.batch_start, batch.batch_end)),
+                                                                     FF:  Array.from(log_msg.FF.slice(batch.batch_start, batch.batch_end)),
+                                                                     DFF: ("DFF" in log_msg) ? Array.from(log_msg.DFF.slice(batch.batch_start, batch.batch_end)) : null,
+                    })
                 }
             }
 
@@ -1599,11 +1629,6 @@ function load(log_file) {
             PID_log_messages[i].have_data = true
             PID_log_messages.have_data = true
         }
-
-        if (!is_RATE_msg) {
-            delete log.messages[id]
-        }
-
     }
 
     if (!PID_log_messages.have_data) {
@@ -1612,38 +1637,27 @@ function load(log_file) {
     }
 
     // Plot flight data from log
-    log.parseAtOffset("ATT")
-    log.parseAtOffset("RATE")
-    log.parseAtOffset("POS")
-
-    if (Object.keys(log.messages.ATT).length > 0) {
-        const ATT_time = array_scale(Array.from(log.messages.ATT.time_boot_ms), 1 / 1000)
+    if ("ATT" in log.messageTypes) {
+        const ATT_time = TimeUS_to_seconds(log.get("ATT", "TimeUS"))
         flight_data.data[0].x = ATT_time
-        flight_data.data[0].y = Array.from(log.messages.ATT.Roll)
+        flight_data.data[0].y = log.get("ATT", "Roll")
 
         flight_data.data[1].x = ATT_time
-        flight_data.data[1].y = Array.from(log.messages.ATT.Pitch)
+        flight_data.data[1].y = log.get("ATT", "Pitch")
     }
 
-    if (Object.keys(log.messages.RATE).length > 0) {
-        flight_data.data[2].x = array_scale(Array.from(log.messages.RATE.time_boot_ms), 1 / 1000)
-        flight_data.data[2].y = Array.from(log.messages.RATE.AOut)
+
+    if ("RATE" in log.messageTypes) {
+        flight_data.data[2].x = TimeUS_to_seconds(log.get("RATE", "TimeUS"))
+        flight_data.data[2].y = log.get("RATE", "AOut")
     }
 
-    log.parseAtOffset("POS")
-    if (Object.keys(log.messages.POS).length > 0) {
-        flight_data.data[3].x = array_scale(Array.from(log.messages.POS.time_boot_ms), 1 / 1000)
-        flight_data.data[3].y = Array.from(log.messages.POS.RelHomeAlt)
+    if ("POS" in log.messageTypes) {
+        flight_data.data[3].x = TimeUS_to_seconds(log.get("POS", "TimeUS"))
+        flight_data.data[3].y = log.get("POS", "RelHomeAlt")
     }
 
     Plotly.redraw("FlightData")
-
-    // Were now done with the log, delete it to save memory before starting calculations
-    delete log.buffer
-    delete log.data
-    delete log.messages
-    log_file = null
-    log = null
 
     // Caculate output
     for (var PID of PID_log_messages) {
@@ -1663,15 +1677,15 @@ function load(log_file) {
                 const len = batch.P.length
                 batch.Out = new Array(len)
                 for (let i = 0; i<len; i++) {
-                    batch.Out[i] = batch.P[i] + batch.I[i] + batch.D[i] + batch.FF[i]
+                    batch.Out[i] = batch.P[i] + batch.I[i] + batch.D[i] + batch.FF[i] + (batch.DFF != null ? batch.DFF[i] : 0)
                 }
             }
         }
     }
 
     // Update ranges of start and end time
-    start_time = Math.floor(PID_log_messages.start_time)
-    end_time = Math.ceil(PID_log_messages.end_time)
+    let start_time = Math.floor(PID_log_messages.start_time)
+    let end_time = Math.ceil(PID_log_messages.end_time)
 
     var start_input = document.getElementById("TimeStart")
     start_input.disabled = false;

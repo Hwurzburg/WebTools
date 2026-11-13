@@ -1,446 +1,12 @@
 // A js tool for plotting ArduPilot batch log data
 
-// Use browser-cjs to load fft lib
-// https://github.com/indutny/fft.js
-// Much faster than math.fft!
-const FFT_lib = require("https://unpkg.com/fft.js@4.0.4/lib/fft.js")
-
 var DataflashParser
-import('../JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default });
-
-// Generic Class to hold source for notch target
-class NotchTarget {
-    constructor(log, msg_name, key_name, name, mode_value) {
-        this.name = name
-        this.mode_value = mode_value
-        this.data = []
-
-        // Don't always need log data (static notch)
-        if (log == null) {
-            return
-        }
-
-        // Grab data from log
-        log.parseAtOffset(msg_name)
-        if ((log.messages[msg_name] == null) || (Object.keys(log.messages[msg_name]).length == 0)) {
-            return
-        }
-
-        // Grab all given keys to data struct
-        const len = log.messages[msg_name].time_boot_ms.length
-        this.data.time = new Array(len)
-        this.data.value = new Array(len)
-        for (var i=0; i < len; i++) {
-            this.data.time[i] = log.messages[msg_name].time_boot_ms[i] / 1000
-            this.data.value[i] = log.messages[msg_name][key_name][i]
-        }
-    }
-
-    interpolate(instance, time) {
-        if (!this.have_data()) {
-            return
-        }
-        if (this.data.interpolated == null) {
-            this.data.interpolated = []
-        }
-        this.data.interpolated[instance] = linear_interp(this.data.value, this.data.time, time)
-    }
-
-    get_target_freq(config) {
-        if (!this.have_data() || (this.data.time == null)) {
-            return
-        }
-        if (config.ref == 0) {
-            return { freq:[config.freq, config.freq], time:[this.data.time[0], this.data.time[this.data.time.length-1]] }
-        }
-        const len = this.data.value.length
-        var freq = new Array(len)
-        for (let j=0;j<len;j++) {
-            freq[j] = this.get_target_freq_index(config, j)
-        }
-        return { freq:freq, time:this.data.time }
-    }
-
-    get_interpolated_target_freq(instance, index, config) {
-        if ((this.data.interpolated == null) || (this.data.interpolated[instance] == null) || (this.data.interpolated[instance].length == 0)) {
-            return null
-        }
-
-        return [this.get_target(config, this.data.interpolated[instance][index])]
-    }
-
-    have_data() {
-        return Object.keys(this.data).length > 0
-    }
-
-    get_mean_value(time, value) {
-        // Find the start and end index
-        const start_index = find_start_index(time)
-        const end_index = find_end_index(time)
-
-        // Take mean from start to end
-        var mean = 0
-        for (let j=start_index;j<end_index;j++) {
-            mean += value[j]
-        }
-        mean /= (end_index - start_index)
-
-        return mean
-    }
-
-    get_mean() {
-        if (this.have_data()) {
-            return this.get_mean_value(this.data.time, this.data.value)
-        }
-    }
-
-}
-
-// Tracking mode specific classes
-class StaticTarget extends NotchTarget {
-    constructor(log) {
-        super(null, null, null, "Static", 0)
-    }
-
-    // Don't need to interpolate static
-    interpolate(instance, time) { }
-
-    get_target_freq(config) {
-        return { freq:[config.freq, config.freq], time:[Gyro_batch.start_time, Gyro_batch.end_time] }
-    }
-
-    get_target_freq_time(config, time) {
-        // Target is independent of time
-        return [config.freq]
-    }
-
-    get_interpolated_target_freq(instance, index, config) {
-        return [config.freq]
-    }
-
-    have_data() {
-        return true
-    }
-}
-
-class ThrottleTarget extends NotchTarget {
-    constructor(log) {
-        super(log, "RATE", "AOut", "Throttle", 1)
-    }
-
-    get_target(config, AOut) {
-        if (config.ref == 0) {
-            return config.freq
-        }
-        const motors_throttle = Math.max(0, AOut)
-        return config.freq * Math.max(config.min_ratio, Math.sqrt(motors_throttle / config.ref))
-    }
-
-    get_target_freq_index(config, index) {
-        return this.get_target(config, this.data.value[index])
-    }
-
-}
-
-class RPMTarget extends NotchTarget {
-    constructor(log, instance, mode_value) {
-        super(log, "RPM", "rpm" + instance, "RPM" + instance, mode_value)
-    }
-
-    get_target(config, rpm) {
-        if (config.ref == 0) {
-            return config.freq
-        }
-        if (rpm > 0) {
-            return Math.max(config.freq, rpm * config.ref * (1.0/60.0))
-        }
-        return config.freq
-    }
-
-    get_target_freq_index(config, index) {
-        return this.get_target(config, this.data.value[index])
-    }
-
-}
-
-class ESCTarget extends NotchTarget {
-    constructor(log) {
-        super(null, null, null, "ESC", 3)
-
-        // Grab data from log, have to do it a little differently to get instances
-        const msg = "ESC"
-        log.parseAtOffset(msg)
-        if ((log.messages[msg] == null) || (log.messages[msg].length == 0)) {
-            return
-        }
-
-        // Individual RPM
-        var instances = 0
-        var instance_map = []
-        for (let i=0;i<16;i++) {
-            const inst_msg = msg + "[" + i + "]"
-            if (log.messages[inst_msg] != null) {
-                this.data[instances] = { time:[], freq:[] }
-                for (var j=0; j < log.messages[inst_msg].time_boot_ms.length; j++) {
-                    this.data[instances].time[j] = log.messages[inst_msg].time_boot_ms[j] / 1000
-                    this.data[instances].freq[j] = log.messages[inst_msg].RPM[j] / 60
-                }
-                instance_map[i] = instances
-                instances++
-            }
-        }
-
-        // Average RPM
-        this.data.avg_freq = []
-        this.data.avg_time = []
-        var inst = []
-        for (let i=0;i<instances;i++) {
-            inst[i] = { rpm:null, time_ms:null }
-        }
-        for (let i=0;i<log.messages[msg].length;i++) {
-            // Update instance
-            const instance = instance_map[log.messages[msg][i].Instance]
-            const time_ms = log.messages[msg][i].time_boot_ms
-            inst[instance].rpm = log.messages[msg][i].RPM
-            inst[instance].time_ms = time_ms
-
-            // Invalidate any instance that has timed out
-            for (let j=0;j<instances;j++) {
-                if ((j != instance) && (inst[j].time_ms != null) && ((time_ms - inst[j].time_ms) > 1000)) {
-                    inst[j].time_ms = null
-                    inst[j].rpm = null
-                }
-            }
-
-            // If a full set of valid instances take average
-            var expected_count = 0
-            var count = 0
-            var sum = 0
-            for (let j=0;j<instances;j++) {
-                if (inst[j].rpm != null) {
-                    count++
-                    sum += inst[j].rpm
-                }
-                if (inst[j].time_ms != null) {
-                    expected_count++
-                }
-            }
-
-            if ((count > 0) && (count == expected_count)) {
-                this.data.avg_freq.push((sum / count) / 60)
-                this.data.avg_time.push(time_ms / 1000)
-
-                // Invalidate used values
-                for (let j=0;j<instances;j++) {
-                    inst[j].rpm = null
-                }
-            }
-        }
-    }
-
-    interpolate(instance, time) {
-        if (!this.have_data()) {
-            return
-        }
-        if (this.data.interpolated == null) {
-            this.data.interpolated = []
-        }
-        this.data.interpolated[instance] = []
-        for (var j=0; j < this.data.length; j++) {
-            this.data.interpolated[instance][j] = linear_interp(this.data[j].freq, this.data[j].time, time)
-        }
-        this.data.interpolated[instance].avg_freq = linear_interp(this.data.avg_freq, this.data.avg_time, time)
-    }
-
-    get_interpolated_target_freq(instance, index, config) {
-        if ((this.data.interpolated == null) || (this.data.interpolated[instance] == null) || (this.data.interpolated[instance].length == 0)) {
-            return null
-        }
-
-        const dynamic = (config.options & (1<<1)) != 0
-        if (dynamic) {
-            const len = this.data.length
-            let ret = new Array(len)
-            for (var j=0; j < len; j++) {
-                ret[j] = this.get_target(config, this.data.interpolated[instance][j][index])
-            }
-            return ret
-        }
-        
-        return [this.get_target(config, this.data.interpolated[instance].avg_freq[index])]
-    }
-
-    get_target(config, rpm) {
-        if (config.ref == 0) {
-            return config.freq
-        }
-        return Math.max(rpm, config.freq)
-    }
-
-    get_target_freq(config) {
-        if (!this.have_data()) {
-            return
-        }
-
-        const dynamic = (config.options & (1<<1)) != 0
-        if (dynamic) {
-            // Tracking individual motor RPM's
-            const len = this.data.length
-            let freq = new Array(len)
-            let time = new Array(len)
-
-            for (let i = 0; i < len; i++) {
-                const inst_len = this.data[i].freq.length
-                let inst_freq = new Array(inst_len)
-                for (let j = 0; j < inst_len; j++) {
-                    inst_freq[j] = this.get_target(config, this.data[i].freq[j])
-                }
-
-                time[i] = this.data[i].time
-                freq[i] = inst_freq
-            }
-            return { freq:freq, time:time }
-
-        }
-
-        // Tracking average motor rpm
-        const len = this.data.avg_freq.length
-        let freq = new Array(len)
-        for (let j = 0; j < len; j++) {
-            freq[j] = this.get_target(config, this.data.avg_freq[j])
-        }
-
-        return { freq:freq, time:this.data.avg_time }
-    }
-
-    get_mean() {
-        if (!this.have_data()) {
-            return
-        }
-        const mean_freq = this.get_mean_value(this.data.avg_time, this.data.avg_freq)
-        if (mean_freq != undefined) {
-            return mean_freq * 60
-        }
-    }
-
-    get_num_motors() {
-        if (this.have_data()) {
-            return this.data.length
-        }
-    }
-
-}
-
-class FFTTarget extends NotchTarget {
-    constructor(log) {
-        super(log, "FTN1", "PkAvg", "FFT", 4)
-
-        // Grab data from log, have to do it a little differently to get instances
-        const msg = "FTN2"
-        log.parseAtOffset(msg)
-        if ((log.messages[msg] == null) || (log.messages[msg].length == 0)) {
-            return
-        }
-
-        for (let i=0;i<3;i++) {
-            // FFT can track three peaks
-            const inst_msg = msg + "[" + i + "]"
-            if (log.messages[inst_msg] != null) {
-                this.data[i] = { time:[], freq:[] }
-                for (var j=0; j < log.messages[inst_msg].time_boot_ms.length; j++) {
-
-                    // Do noise weighting between axis to get a single frequency
-                    // Same as `get_weighted_freq_hz` function in AP_GyroFFT
-                    const energy_x = log.messages[inst_msg].EnX[j]
-                    const energy_y = log.messages[inst_msg].EnY[j]
-                    const freq_x = log.messages[inst_msg].PkX[j]
-                    const freq_y = log.messages[inst_msg].PkY[j]
-
-                    if ((energy_x > 0) && (energy_y > 0)) {
-                        // Weighted by relative energy
-                        this.data[i].freq[j] = (freq_x*energy_x + freq_y*energy_y) / (energy_x + energy_y)
-                    } else {
-                        // Just take average
-                        this.data[i].freq[j] = (freq_x + freq_y) * 0.5
-                    }
-                    this.data[i].time[j] = log.messages[inst_msg].time_boot_ms[j] / 1000
-                }
-            }
-        }
-    }
-
-    interpolate(instance, time) {
-        if (!this.have_data()) {
-            return
-        }
-        if (this.data.interpolated == null) {
-            this.data.interpolated = []
-        }
-        this.data.interpolated[instance] = []
-        for (var j=0; j < this.data.length; j++) {
-            this.data.interpolated[instance][j] = linear_interp(this.data[j].freq, this.data[j].time, time)
-        }
-        this.data.interpolated[instance].value = linear_interp(this.data.value, this.data.time, time)
-    }
-
-    get_interpolated_target_freq(instance, index, config) {
-        if ((this.data.interpolated == null) || (this.data.interpolated[instance] == null) || (this.data.interpolated[instance].length == 0)) {
-            return null
-        }
-
-        const dynamic = (config.options & (1<<1)) != 0
-        if (dynamic) {
-            const len = this.data.length
-            let ret = new Array(len)
-            for (var j=0; j < len; j++) {
-                ret[j] = this.get_target(config, this.data.interpolated[instance][j][index])
-            }
-            return ret
-        }
-        
-        return [this.get_target(config, this.data.interpolated[instance].value[index])]
-    }
-
-    get_target(config, rpm) {
-        if (config.ref == 0) {
-            return config.freq
-        }
-        return Math.max(rpm, config.freq)
-    }
-
-    get_target_freq(config) {
-        if (!this.have_data()) {
-            return
-        }
-
-        const dynamic = (config.options & (1<<1)) != 0
-        if (dynamic) {
-            // Tracking multiple peaks
-            const len = this.data.length
-            let freq = new Array(len)
-            let time = new Array(len)
-
-            for (let i = 0; i < len; i++) {
-                const inst_len = this.data[i].freq.length
-                let inst_freq = new Array(inst_len)
-                for (let j = 0; j < inst_len; j++) {
-                    inst_freq[j] = this.get_target(config, this.data[i].freq[j])
-                }
-
-                time[i] = this.data[i].time
-                freq[i] = inst_freq
-            }
-            return { freq:freq, time:time }
-        }
-
-        // Just center peak
-        const len = this.data.value.length
-        let freq = new Array(len)
-        for (let j = 0; j < len; j++) {
-            freq[j] = this.get_target(config, this.data.value[j])
-        }
-        return { freq:freq, time:this.data.time }
-    }
+const import_done = import('../modules/JsDataflashParser/parser.js').then((mod) => { DataflashParser = mod.default })
+
+// micro seconds to seconds helpers
+const US2S = 1 / 1000000
+function TimeUS_to_seconds(TimeUS) {
+    return array_scale(TimeUS, US2S)
 }
 
 function DigitalBiquadFilter(freq) {
@@ -448,20 +14,20 @@ function DigitalBiquadFilter(freq) {
 
     if (this.target_freq <= 0) {
         this.transfer = function(Hn, Hd, sample_freq, Z1, Z2) { }
-        return this;
+        return this
     }
 
     this.transfer = function(Hn, Hd, sample_freq, Z1, Z2) {
 
-        const fr = sample_freq/this.target_freq;
-        const ohm = Math.tan(Math.PI/fr);
-        const c = 1.0+2.0*Math.cos(Math.PI/4.0)*ohm + ohm*ohm;
+        const fr = sample_freq/this.target_freq
+        const ohm = Math.tan(Math.PI/fr)
+        const c = 1.0+2.0*Math.cos(Math.PI/4.0)*ohm + ohm*ohm
 
-        const b0 = ohm*ohm/c;
-        const b1 = 2.0*b0;
-        const b2 = b0;
-        const a1 = 2.0*(ohm*ohm-1.0)/c;
-        const a2 = (1.0-2.0*Math.cos(Math.PI/4.0)*ohm+ohm*ohm)/c;
+        const b0 = ohm*ohm/c
+        const b1 = 2.0*b0
+        const b2 = b0
+        const a1 = 2.0*(ohm*ohm-1.0)/c
+        const a2 = (1.0-2.0*Math.cos(Math.PI/4.0)*ohm+ohm*ohm)/c
 
         // Build transfer function and apply to H division done at final step
         const len = Z1[0].length
@@ -497,28 +63,41 @@ function DigitalBiquadFilter(freq) {
     return this
 }
 
-function NotchFilter(attenuation_dB, bandwidth_hz, harmonic_mul) {
-    this.attenuation_dB = attenuation_dB
-    this.bandwidth_hz = bandwidth_hz
-    this.harmonic_mul = (harmonic_mul != null) ? harmonic_mul : 1
-    this.Asq = (10.0**(-this.attenuation_dB / 40.0))**2
+function NotchFilter(attenuation_dB, bandwidth_hz, harmonic_mul, min_freq_fun, spread_mul) {
+    this.A = 10.0**(-attenuation_dB / 40.0)
 
     this.transfer = function(Hn, Hd, center, sample_freq, Z1, Z2) {
-        const center_freq_hz = center * this.harmonic_mul
+        let center_freq_hz = center * harmonic_mul
 
         // check center frequency is in the allowable range
-        if ((center_freq_hz <= 0.5 * this.bandwidth_hz) || (center_freq_hz >= 0.5 * sample_freq)) {
+        if ((center_freq_hz <= 0.5 * bandwidth_hz) || (center_freq_hz >= 0.5 * sample_freq)) {
             return
         }
 
-        const octaves = Math.log2(center_freq_hz / (center_freq_hz - this.bandwidth_hz / 2.0)) * 2.0
+        const min_freq = min_freq_fun(harmonic_mul)
+        let A = this.A
+        if (center_freq_hz < min_freq) {
+            const disable_freq = min_freq * 0.25
+            if (center_freq_hz < disable_freq) {
+                // Disabled
+                return
+            }
+
+            // Reduce attenuation (A of 1.0 is no attenuation)
+            const ratio = (center_freq_hz - disable_freq) / (min_freq - disable_freq)
+            A = 1.0 + (A - 1.0) * ratio
+        }
+        center_freq_hz = Math.max(center_freq_hz, min_freq) * spread_mul
+
+        const octaves = Math.log2(center_freq_hz / (center_freq_hz - bandwidth_hz / 2.0)) * 2.0
         const Q = ((2.0**octaves)**0.5) / ((2.0**octaves) - 1.0)
+        const Asq = A**2
 
         const omega = 2.0 * Math.PI * center_freq_hz / sample_freq
         const alpha = Math.sin(omega) / (2 * Q)
-        const b0 =  1.0 + alpha*this.Asq
+        const b0 =  1.0 + alpha*Asq
         const b1 = -2.0 * Math.cos(omega)
-        const b2 =  1.0 - alpha*this.Asq
+        const b2 =  1.0 - alpha*Asq
         const a0 =  1.0 + alpha
         const a1 = b1
         const a2 =  1.0 - alpha
@@ -557,33 +136,28 @@ function NotchFilter(attenuation_dB, bandwidth_hz, harmonic_mul) {
     return this
 }
 
-function MultiNotch(attenuation_dB, bandwidth_hz, harmonic, num) {
-    this.bandwidth = bandwidth_hz
-    this.harmonic = harmonic
+function MultiNotch(attenuation_dB, bandwidth_hz, harmonic, min_freq_fun, num, center) {
 
-    const bw_scaled = this.bandwidth / num
+    // Calculate spread required to achieve an equivalent single notch using two notches with Bandwidth/2
+    const notch_spread = bandwidth_hz / (32.0 * center)
+
+    const bw_scaled = (bandwidth_hz * harmonic) / num
 
     this.notches = []
-    this.notches.push(new NotchFilter(attenuation_dB, bw_scaled))
-    this.notches.push(new NotchFilter(attenuation_dB, bw_scaled))
-    if (num == 3) {
-        this.notches.push(new NotchFilter(attenuation_dB, bw_scaled))
+    this.notches.push(new NotchFilter(attenuation_dB, bw_scaled, harmonic, min_freq_fun, 1.0 - notch_spread))
+    this.notches.push(new NotchFilter(attenuation_dB, bw_scaled, harmonic, min_freq_fun, 1.0 + notch_spread))
+    if (num >= 3) {
+        this.notches.push(new NotchFilter(attenuation_dB, bw_scaled, harmonic, min_freq_fun, 1.0))
+    }
+    if (num == 5) {
+        this.notches.push(new NotchFilter(attenuation_dB, bw_scaled, harmonic, min_freq_fun, 1.0 - (2.0 * notch_spread)))
+        this.notches.push(new NotchFilter(attenuation_dB, bw_scaled, harmonic, min_freq_fun, 1.0 + (2.0 * notch_spread)))
     }
 
     this.transfer = function(Hn, Hd, center, sample_freq, Z1, Z2) {
-        center = center * this.harmonic
-
-        // Calculate spread required to achieve an equivalent single notch using two notches with Bandwidth/2
-        const notch_spread = this.bandwidth / (32.0 * center);
-
-        const bandwidth_limit = this.bandwidth * 0.52
-        const nyquist_limit = sample_freq * 0.48
-        center = Math.min(Math.max(center, bandwidth_limit), nyquist_limit)
-
-        this.notches[0].transfer(Hn, Hd, center*(1-notch_spread), sample_freq, Z1, Z2)
-        this.notches[1].transfer(Hn, Hd, center*(1+notch_spread), sample_freq, Z1, Z2)
-        if (this.notches.length == 3) {
-            this.notches[2].transfer(Hn, Hd, center, sample_freq, Z1, Z2)
+        const len = this.notches.length
+        for (let i = 0; i<len; i++) {
+            this.notches[i].transfer(Hn, Hd, center, sample_freq, Z1, Z2)
         }
     }
 
@@ -600,8 +174,8 @@ function HarmonicNotchFilter(params) {
     for (let j=0;j<tracking_methods.length;j++) {
         if (this.params.mode == tracking_methods[j].mode_value) {
             this.tracking = tracking_methods[j]
-            if ((this.params.enable > 0) && !this.tracking.have_data()) {
-                alert("No tracking data available for " + this.tracking.name + " notch")
+            if ((this.params.enable > 0) && !this.tracking.have_data(this.params)) {
+                this.tracking.no_data_error(this.params)
             }
             break
         }
@@ -612,11 +186,15 @@ function HarmonicNotchFilter(params) {
     }
 
     this.enabled = function() {
-        return (this.params.enable > 0) && (this.tracking != null) && this.tracking.have_data()
+        return (this.params.enable > 0) && (this.tracking != null) && this.tracking.have_data(this.params)
     }
 
     this.static = function() {
         return this.tracking.mode_value == 0
+    }
+
+    this.harmonics = function() {
+        return this.params.harmonics
     }
 
     if (!this.enabled()) {
@@ -625,19 +203,47 @@ function HarmonicNotchFilter(params) {
         return this
     }
 
+    const filter_version = get_filter_version()
+
+    const quintuple = (this.params.options & 64) != 0
     const triple = (this.params.options & 16) != 0
     const double = (this.params.options & 1) != 0
-    const single = !double && !triple
+
+    let num_composite_notches = 1
+    if (double) {
+        num_composite_notches = 2
+    } else if (triple) {
+        num_composite_notches = 3
+    } else if (quintuple) {
+        if (filter_version < 4) {
+            alert("Quintuple notch only supported with filter version 4 or later")
+        } else {
+            num_composite_notches = 5
+        }
+    }
+
+    const filter_V1 = filter_version == 1
+    const treat_low_freq_as_min = (this.params.options & 32) != 0
+
+    this.get_min_freq = function(harmonic) {
+        if (filter_V1) {
+            return 0.0
+        }
+        const min_freq = this.params.freq * this.params.min_ratio
+        if (treat_low_freq_as_min) {
+            return min_freq * harmonic
+        }
+        return min_freq
+    }
 
     this.notches = []
     for (var n=0; n<max_num_harmonics; n++) {
         if (this.params.harmonics & (1<<n)) {
             const harmonic = n + 1
-            const bandwidth = this.params.bandwidth * harmonic
-            if (single) {
-                this.notches.push(new NotchFilter(this.params.attenuation, bandwidth, harmonic))
+            if (num_composite_notches == 1) {
+                this.notches.push(new NotchFilter(this.params.attenuation, this.params.bandwidth * harmonic, harmonic, (h) => { return this.get_min_freq(h) }, 1.0))
             } else {
-                this.notches.push(new MultiNotch(this.params.attenuation, bandwidth, harmonic, double ? 2 : 3))
+                this.notches.push(new MultiNotch(this.params.attenuation, this.params.bandwidth, harmonic, (h) => { return this.get_min_freq(h) }, num_composite_notches, this.params.freq))
             }
         }
     }
@@ -665,9 +271,6 @@ function HarmonicNotchFilter(params) {
         return this.tracking.name
     }
 
-    this.harmonics = function() {
-        return this.params.harmonics
-    }
     return this
 }
 
@@ -708,7 +311,7 @@ function run_batch_fft(data_set) {
 
     if (!Number.isInteger(Math.log2(window_size))) {
         alert('Window size must be a power of two')
-        throw new Error();
+        throw new Error()
     }
 
     const window_spacing = Math.round(window_size * (1 - window_overlap))
@@ -720,7 +323,7 @@ function run_batch_fft(data_set) {
     // Get bins
     var bins = rfft_freq(window_size, sample_time)
 
-    const fft = new FFT_lib(window_size);
+    const fft = new FFTJS(window_size)
 
     var x = []
     var y = []
@@ -758,10 +361,21 @@ function get_FFT_data_index(gyro_num, plot_type, axi) {
 // Attempt to put page back to for a new log
 function reset() {
 
+    document.title = "ArduPilot Filter Review"
+
+    document.getElementById("log_type_raw").checked = true
+    document.getElementById("log_type_batch").disabled = false
+    document.getElementById("log_type_raw").disabled = false
+
     document.getElementById("FFTWindow_per_batch").disabled = true
     document.getElementById("FFTWindow_size").disabled = true
     document.getElementById("TimeStart").disabled = true
     document.getElementById("TimeEnd").disabled = true
+
+    for (const version of supported_filter_versions) {
+        document.getElementById("filter_version_" + version).disabled = true
+    }
+    document.getElementById("filter_version_1").checked = true
     document.getElementById("calculate").disabled = true
     document.getElementById("calculate_filters").disabled = true
     document.getElementById("OpenFilterTool").disabled = true
@@ -805,7 +419,7 @@ function reset() {
     parameter_set_disable("SCHED_LOOP_RATE", true)
     const notch_params = get_HNotch_param_names()
     for (let i = 0; i < notch_params.length; i++) {
-        for (param of Object.values(notch_params[i])) {
+        for (let param of Object.values(notch_params[i])) {
             parameter_set_disable(param, true)
         }
     }
@@ -839,8 +453,12 @@ function reset() {
         check.checked = true
     }
 
+    let check = document.getElementById("SpecNotchShowLogged")
+    check.disabled = true
+    check.checked = false
+
     // Set param defaults that are none 0
-    const defualts = [{name: "_FREQ",   value: 80},
+    const defaults = [{name: "_FREQ",   value: 80},
                       {name: "_BW",     value: 40},
                       {name: "_ATT",    value: 40},
                       {name: "_HMNCS",  value: 3},
@@ -850,13 +468,21 @@ function reset() {
     const HNotch_params = get_HNotch_param_names()
     for (let i = 0; i < HNotch_params.length; i++) {
         for (const param of Object.values(HNotch_params[i])) {
-            for (const defualt of defualts) {
-                if (param.endsWith(defualt.name)) {
-                    parameter_set_value(param, defualt.value)
+            let found = false
+            for (const default_val of defaults) {
+                if (param.endsWith(default_val.name)) {
+                    parameter_set_value(param, default_val.value)
+                    found = true
+                    break
                 }
+            }
+            if (!found) {
+                parameter_set_value(param, 0)
             }
         }
     }
+
+    have_INS_RAW_LOG_OPT = false;
 
 }
 
@@ -889,9 +515,9 @@ function setup_plots() {
     flight_data.layout = {
         xaxis: { title: {text: time_scale_label },
                  domain: [0.07, 0.93],
-                 type: "linear", 
-                 zeroline: false, 
-                 showline: true, 
+                 type: "linear",
+                 zeroline: false,
+                 showline: true,
                  mirror: true,
                  rangeslider: {} },
         showlegend: false,
@@ -920,7 +546,7 @@ function setup_plots() {
 
     var plot = document.getElementById("FlightData")
     Plotly.purge(plot)
-    Plotly.newPlot(plot, flight_data.data, flight_data.layout, {displaylogo: false});
+    Plotly.newPlot(plot, flight_data.data, flight_data.layout, {displaylogo: false})
 
     // Update start and end time based on range
     document.getElementById("FlightData").on('plotly_relayout', function(data) {
@@ -1012,9 +638,9 @@ function setup_plots() {
         }
     }
 
-    var plot = document.getElementById("FFTPlot")
+    plot = document.getElementById("FFTPlot")
     Plotly.purge(plot)
-    Plotly.newPlot(plot, fft_plot.data, fft_plot.layout, {displaylogo: false});
+    Plotly.newPlot(plot, fft_plot.data, fft_plot.layout, {displaylogo: false})
 
     // Bode plot setup
     Bode.data = []
@@ -1053,7 +679,7 @@ function setup_plots() {
 
     plot = document.getElementById("Bode")
     Plotly.purge(plot)
-    Plotly.newPlot(plot, Bode.data, Bode.layout, {displaylogo: false});
+    Plotly.newPlot(plot, Bode.data, Bode.layout, {displaylogo: false})
 
     // Spectrogram setup
     // Add surface
@@ -1066,7 +692,7 @@ function setup_plots() {
     }]
 
     // Add tracking lines
-    // Two harmonic notch filters each with upto 8 harmonics
+    // Two harmonic notch filters each with upto 16 harmonics
     for (let i=0;i<2;i++) {
         let Group_name = "Notch " + (i+1)
         let dash = (i == 0) ? "solid" : "dot"
@@ -1075,11 +701,30 @@ function setup_plots() {
             Spectrogram.data.push({
                 type:"scatter",
                 mode: "lines",
-                line: { width: 4, dash: dash },
+                line: { width: 2, dash: dash },
                 visible: false,
                 name: name,
                 meta: Group_name + "<br>" + name,
                 legendgroup: i,
+                legendgrouptitle: { text: "" }
+            })
+        }
+    }
+
+    // Logged notch tacking
+    for (let i=0;i<2;i++) {
+        let Group_name = "Logged Notch " + (i+1)
+        let dash = (i == 0) ? "solid" : "dot"
+        for (let j=0;j<max_num_harmonics;j++) {
+            let name = (j == 0) ? "Fundamental" : "Harmonic " + (j+1)
+            Spectrogram.data.push({
+                type:"scatter",
+                mode: "lines",
+                line: { width: 2, dash: dash },
+                visible: false,
+                name: name,
+                meta: Group_name + "<br>" + name,
+                legendgroup: i+2,
                 legendgrouptitle: { text: "" }
             })
         }
@@ -1096,7 +741,7 @@ function setup_plots() {
 
     plot = document.getElementById("Spectrogram")
     Plotly.purge(plot)
-    Plotly.newPlot(plot, Spectrogram.data, Spectrogram.layout, {displaylogo: false});
+    Plotly.newPlot(plot, Spectrogram.data, Spectrogram.layout, {displaylogo: false})
 
     // Link all frequency axis
     link_plot_axis_range([["FFTPlot", "x", "", fft_plot],
@@ -1124,8 +769,10 @@ function re_calc() {
 
     redraw()
 
-    const end = performance.now();
-    console.log(`Re-calc took: ${end - start} ms`);
+    update_hidden_params()
+
+    const end = performance.now()
+    console.log(`Re-calc took: ${end - start} ms`)
 }
 
 // Force full re-calc on next run, on window size change
@@ -1307,64 +954,20 @@ function calculate_transfer_function() {
     document.getElementById("calculate_filters").disabled = true
 }
 
-
 // Get configured amplitude scale
 function get_amplitude_scale() {
+    const use_DB = document.getElementById("ScaleLog").checked
+    const use_PSD = document.getElementById("ScalePSD").checked
 
-    const use_DB = document.getElementById("ScaleLog").checked;
-    const use_PSD = document.getElementById("ScalePSD").checked;
-
-    var ret = {}
-    if (use_PSD) {
-        ret.fun = function (x) { return array_mul(x,x) } // x.^2
-        ret.scale = function (x) { return array_scale(array_log10(x), 10.0) } // 10 * log10(x)
-        ret.label = "PSD (dB/Hz)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} dB/Hz" }
-        ret.window_correction = function(correction, resolution) { return ((correction.energy**2) * 0.5) / resolution }
-        ret.quantization_correction = function(window_correction) { return 1 / Math.sqrt(window_correction) }
-
-    } else if (use_DB) {
-        ret.fun = function (x) { return x }
-        ret.scale = function (x) { return array_scale(array_log10(x), 20.0) } // 20 * log10(x)
-        ret.label = "Amplitude (dB)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} dB" }
-        ret.correction_scale = 1.0
-        ret.window_correction = function(correction, resolution) { return correction.linear }
-        ret.quantization_correction = function(window_correction) { return 1 / window_correction }
-
-    } else {
-        ret.fun = function (x) { return x }
-        ret.scale = function (x) { return x }
-        ret.label = "Amplitude"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f}" }
-        ret.window_correction = function(correction, resolution) { return correction.linear }
-        ret.quantization_correction = function(window_correction) { return 1 / window_correction }
-
-    }
-
-    return ret
+    return fft_amplitude_scale(use_DB, use_PSD)
 }
 
 // Get configured frequency scale object
 function get_frequency_scale() {
+    const use_RPM = document.getElementById("freq_Scale_RPM").checked
+    const log_scale = document.getElementById("freq_ScaleLog").checked
 
-    const use_RPM = document.getElementById("freq_Scale_RPM").checked;
-
-    var ret = {}
-    if (use_RPM) {
-        ret.fun = function (x) { return array_scale(x, 60.0) }
-        ret.label = "RPM"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} RPM" }
-
-    } else {
-        ret.fun = function (x) { return x }
-        ret.label = "Frequency (Hz)"
-        ret.hover = function (axis) { return "%{" + axis + ":.2f} Hz" }
-    }
-
-    ret.type = document.getElementById("freq_ScaleLog").checked ? "log" : "linear"
-
-    return ret
+    return fft_frequency_scale(use_RPM, log_scale)
 }
 
 function get_alias_obj(FFT) {
@@ -1429,7 +1032,7 @@ function find_start_index(time) {
     const start_time = parseFloat(document.getElementById("TimeStart").value)
 
     var start_index = 0
-    for (j = 0; j<time.length; j++) {
+    for (let j = 0; j<time.length; j++) {
         // Move forward start index while time is less than start time
         if (time[j] < start_time) {
             start_index = j
@@ -1443,7 +1046,7 @@ function find_end_index(time) {
     const end_time = parseFloat(document.getElementById("TimeEnd").value)
 
     var end_index = 0
-    for (j = 0; j<time.length-1; j++) {
+    for (let j = 0; j<time.length-1; j++) {
         // Move forward end index while time is less than end time
         if (time[j] <= end_time) {
             end_index = j + 1
@@ -1594,7 +1197,7 @@ function redraw() {
 
         const fundamental = filters.notch[i].get_target_freq()
 
-        function get_mean_and_range(time, freq) {
+        function get_mean_and_range(time, freq_array, harmonic, lower_limit) {
             // Find the start and end index
             const start_index = find_start_index(time)
             const end_index = find_end_index(time)+1
@@ -1604,12 +1207,13 @@ function redraw() {
             var min = null
             var max = null
             for (let j=start_index;j<end_index;j++) {
-                mean += freq[j]
-                if ((min == null) || (freq[j] < min)) {
-                    min = freq[j]
+                const freq = Math.max(freq_array[j] * harmonic, lower_limit)
+                mean += freq
+                if ((min == null) || (freq < min)) {
+                    min = freq
                 }
-                if ((max == null) || (freq[j] > max)) {
-                    max = freq[j]
+                if ((max == null) || (freq > max)) {
+                    max = freq
                 }
             }
             mean /= end_index - start_index
@@ -1617,32 +1221,35 @@ function redraw() {
             return { mean: mean, min:min, max:max}
         }
 
-        var mean
-        var min
-        var max
-        if (!Array.isArray(fundamental.time[0])) {
-            // Single peak
-            let mean_range = get_mean_and_range(fundamental.time, fundamental.freq)
-            mean = mean_range.mean
-            min = mean_range.min
-            max = mean_range.max
+        function get_stats(harmonic, lower_limit) {
+            var mean
+            var min
+            var max
+            if (!Array.isArray(fundamental.time[0])) {
+                // Single peak
+                let mean_range = get_mean_and_range(fundamental.time, fundamental.freq, harmonic, lower_limit)
+                mean = mean_range.mean
+                min = mean_range.min
+                max = mean_range.max
 
-        } else {
-            // Combine multiple peaks
-            mean = 0
-            min = null
-            max = null
-            for (let j=0;j<fundamental.time.length;j++) {
-                let mean_range = get_mean_and_range(fundamental.time[j], fundamental.freq[j])
-                mean += mean_range.mean
-                if ((min == null) || (mean_range.min < min)) {
-                    min = mean_range.min
+            } else {
+                // Combine multiple peaks
+                mean = 0
+                min = null
+                max = null
+                for (let j=0;j<fundamental.time.length;j++) {
+                    let mean_range = get_mean_and_range(fundamental.time[j], fundamental.freq[j], harmonic, lower_limit)
+                    mean += mean_range.mean
+                    if ((min == null) || (mean_range.min < min)) {
+                        min = mean_range.min
+                    }
+                    if ((max == null) || (mean_range.max > max)) {
+                        max = mean_range.max
+                    }
                 }
-                if ((max == null) || (mean_range.max > max)) {
-                    max = mean_range.max
-                }
+                mean /= fundamental.time.length
             }
-            mean /= fundamental.time.length
+            return { mean, min, max }
         }
 
         const show_notch = document.getElementById("Notch" + (i+1) + "Show").checked
@@ -1650,15 +1257,19 @@ function redraw() {
             if ((filters.notch[i].harmonics() & (1<<j)) == 0) {
                 continue
             }
-            const harmonic_freq = frequency_scale.fun([mean * (j+1)])[0]
+
+            const harmonic = j + 1
+            const stats = get_stats(harmonic, filters.notch[i].get_min_freq(harmonic))
+
+            const harmonic_freq = frequency_scale.fun([stats.mean])[0]
 
             const line_index = (i*max_num_harmonics*2) + j*2
             fft_plot.layout.shapes[line_index].visible = show_notch
             fft_plot.layout.shapes[line_index].x0 = harmonic_freq
             fft_plot.layout.shapes[line_index].x1 = harmonic_freq
 
-            const min_freq = frequency_scale.fun([min * (j+1)])[0]
-            const max_freq = frequency_scale.fun([max * (j+1)])[0]
+            const min_freq = frequency_scale.fun([stats.min])[0]
+            const max_freq = frequency_scale.fun([stats.max])[0]
 
             const range_index = line_index + 1
             fft_plot.layout.shapes[range_index].visible = show_notch
@@ -1728,10 +1339,10 @@ function redraw_post_estimate_and_bode() {
         // Get alias helper to fold down frequencies, if enabled
         let alias = get_alias_obj(Gyro_batch[i].FFT)
 
-        // Get indexs for the lines to be plotted
-        X_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 0)
-        Y_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 1)
-        Z_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 2)
+        // Get indexes for the lines to be plotted
+        let X_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 0)
+        let Y_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 1)
+        let Z_plot_index = get_FFT_data_index(Gyro_batch[i].sensor_num, 2, 2)
 
         // Apply aliasing and selected scale, set to y axis
         fft_plot.data[X_plot_index].y = amplitude_scale.scale(alias.apply_amp(corrected_x))
@@ -1923,7 +1534,7 @@ function redraw_Spectrogram() {
 
         if (this_dt > average_dt * 2.5) {
             // Add a gap
-            count = 0;
+            count = 0
             // start gap where next sample would have been expected
             Spectrogram.data[0].x.push(last_time + average_dt)
             skip_flag.push(true)
@@ -1949,7 +1560,7 @@ function redraw_Spectrogram() {
     const num_bins = Spectrogram.data[0].y.length
     Spectrogram.data[0].z = new Array(len)
     let index = 0
-    for (j = 0; j<len; j++) {
+    for (let j = 0; j<len; j++) {
         if (skip_flag[j] == true) {
             // Add null Z values, this results in a blank section in the plot
             Spectrogram.data[0].z[j] = new Array(num_bins)
@@ -1970,10 +1581,12 @@ function redraw_Spectrogram() {
     for (let i=0;i<filters.notch.length;i++) {
         // Plus one for the spectrogram plot
         const plot_offset = i * max_num_harmonics + 1
+        const logged_offset = max_num_harmonics * 2
 
         // Hide all
         for (let j=0;j<max_num_harmonics;j++) {
             Spectrogram.data[plot_offset + j].visible = false
+            Spectrogram.data[plot_offset + logged_offset + j].visible = false
         }
 
         // Filter not setup
@@ -1981,31 +1594,36 @@ function redraw_Spectrogram() {
             continue
         }
 
-        const Group_name = "Notch " + (i+1) + ": " + filters.notch[i].name()
-        const fundamental = filters.notch[i].get_target_freq()
+        function build_plot_array(fundamental) {
+            let time
+            let freq
+            const time_array = Array.isArray(fundamental.time[0])
+            if (!Array.isArray(fundamental.freq[0])) {
+                // Single peak
+                time = fundamental.time
+                freq = fundamental.freq
 
-        let time
-        let freq
-        if (!Array.isArray(fundamental.time[0])) {
-            // Single peak
-            time = fundamental.time
-            freq = fundamental.freq
+            } else {
+                // Tracking multiple peaks
+                time = []
+                freq = []
 
-        } else {
-            // Tracking multiple peaks
-            time = []
-            freq = []
+                for (let j=0;j<fundamental.freq.length;j++) {
+                    time = time.concat(time_array ? fundamental.time[j] : fundamental.time)
+                    freq = freq.concat(fundamental.freq[j])
 
-            for (let j=0;j<fundamental.time.length;j++) {
-                time.push(...fundamental.time[j])
-                freq.push(...fundamental.freq[j])
+                    // Add NAN to remove line from end back to the start
+                    time.push(NaN)
+                    freq.push(NaN)
+                }
 
-                // Add NAN to remove line from end back to the start
-                time.push(NaN)
-                freq.push(NaN)
             }
-
+            return { time, freq }
         }
+
+        let Group_name = "Notch " + (i+1) + ": " + filters.notch[i].name()
+        let fundamental = filters.notch[i].get_target_freq()
+        let plot_data = build_plot_array(fundamental)
 
         // Enable each harmonic
         const show_notch = document.getElementById("SpecNotch" + (i+1) + "Show").checked
@@ -2013,13 +1631,41 @@ function redraw_Spectrogram() {
             if ((filters.notch[i].harmonics() & (1<<j)) == 0) {
                 continue
             }
-            const harmonic_freq = array_scale(freq, j+1)
+            const harmonic = j + 1
+            const harmonic_freq = array_scale(plot_data.freq, harmonic)
+
+            const min_freq = filters.notch[i].get_min_freq(harmonic)
+            for (let n=0;n<harmonic_freq.length;n++) {
+                harmonic_freq[n] = Math.max(harmonic_freq[n], min_freq)
+            }
 
             Spectrogram.data[plot_offset + j].visible = show_notch
-            Spectrogram.data[plot_offset + j].x = time
+            Spectrogram.data[plot_offset + j].x = plot_data.time
             Spectrogram.data[plot_offset + j].y = frequency_scale.fun(harmonic_freq)
             Spectrogram.data[plot_offset + j].hovertemplate = tracking_hovertemplate
             Spectrogram.data[plot_offset + j].legendgrouptitle.text = Group_name
+        }
+
+        // Enable logged notch
+        if (logged_tracking[i].have_data()) {
+            Group_name = "Notch " + (i+1) + ": " + logged_tracking[i].name
+            fundamental = logged_tracking[i].get_target_freq()
+            plot_data = build_plot_array(fundamental)
+
+            const show_logged = document.getElementById("SpecNotchShowLogged").checked
+            const logged_offset = max_num_harmonics * 2
+            for (let j=0;j<max_num_harmonics;j++) {
+                if ((logged_tracking[i].harmonics & (1<<j)) == 0) {
+                    continue
+                }
+                const harmonic_freq = array_scale(plot_data.freq, j+1)
+
+                Spectrogram.data[plot_offset + logged_offset + j].visible = show_notch && show_logged
+                Spectrogram.data[plot_offset + logged_offset + j].x = plot_data.time
+                Spectrogram.data[plot_offset + logged_offset + j].y = frequency_scale.fun(harmonic_freq)
+                Spectrogram.data[plot_offset + logged_offset + j].hovertemplate = tracking_hovertemplate
+                Spectrogram.data[plot_offset + logged_offset + j].legendgrouptitle.text = Group_name
+            }
         }
 
     }
@@ -2031,21 +1677,64 @@ function redraw_Spectrogram() {
 function update_hidden_spec(source) {
 
     const notch_num = parseFloat(source.id.match(/\d+/g)) - 1
+
+    // Offset by the total number of lines over
+    const show_logged = document.getElementById("SpecNotchShowLogged").checked
+    const logged_offset = max_num_harmonics * 2
+
     const plot_offset = notch_num * max_num_harmonics + 1
 
     // Hide all
     for (let j=0;j<max_num_harmonics;j++) {
         Spectrogram.data[plot_offset + j].visible = false
+        Spectrogram.data[plot_offset + logged_offset + j].visible = false
     }
 
     if (source.checked) {
         // Show those that are enabled
         for (let j=0;j<max_num_harmonics;j++) {
-            if ((filters.notch[notch_num].harmonics() & (1<<j)) == 0) {
-                continue
+            if ((filters.notch[notch_num].harmonics() & (1<<j)) != 0) {
+                Spectrogram.data[plot_offset + j].visible = true
             }
-            Spectrogram.data[plot_offset + j].visible = true
+            if (show_logged && (logged_tracking[notch_num].harmonics & (1<<j)) != 0) {
+                Spectrogram.data[plot_offset + logged_offset + j].visible = true
+            }
         }
+    }
+
+    Plotly.redraw("Spectrogram")
+
+}
+
+// update lines show on spectrogram
+function update_logged_notch_hidden_spec(source) {
+
+    // Offset by the total number of lines over
+    const show_logged = source.checked
+    const logged_offset = max_num_harmonics * 2
+
+    for (let i=0;i<filters.notch.length;i++) {
+        const plot_offset = i * max_num_harmonics + 1
+
+        // Hide all
+        for (let j=0;j<max_num_harmonics;j++) {
+            Spectrogram.data[plot_offset + j].visible = false
+            Spectrogram.data[plot_offset + logged_offset + j].visible = false
+        }
+
+        const show_notch = document.getElementById("SpecNotch" + (i+1) + "Show").checked
+        if (show_notch) {
+            // Show those that are enabled
+            for (let j=0;j<max_num_harmonics;j++) {
+                if ((filters.notch[i].harmonics() & (1<<j)) != 0) {
+                    Spectrogram.data[plot_offset + j].visible = true
+                }
+                if (show_logged && (logged_tracking[i].harmonics & (1<<j)) != 0) {
+                    Spectrogram.data[plot_offset + logged_offset + j].visible = true
+                }
+            }
+        }
+
     }
 
     Plotly.redraw("Spectrogram")
@@ -2060,16 +1749,16 @@ function update_hidden(source) {
 
         const post_filter = id.includes("Post")
         const post_estimate = id.includes("PostEst")
-    
+
         var pre_post_index = 0
         if (post_estimate) {
             pre_post_index = 2
         } else if (post_filter) {
             pre_post_index = 1
         }
-    
+
         const axi = id.substr(id.length - 1)
-    
+
         let axi_index
         for (let j=0;j<3;j++) {
             if (axis[j] == axi) {
@@ -2158,12 +1847,14 @@ function get_HNotch_param_names() {
                   ref: prefix[i] + "REF",
                   min_ratio: prefix[i] + "FM_RAT",
                   harmonics: prefix[i] + "HMNCS",
-                  options: prefix[i] + "OPTS"}
+                  options: prefix[i] + "OPTS",
+                  esc_mask: prefix[i] + "ESCMSK"}
     }
     return ret
 }
 
 function load_filters() {
+
     filters = []
     const HNotch_params = get_HNotch_param_names()
 
@@ -2184,6 +1875,27 @@ function load_filters() {
     }
 }
 
+// Update hidden parameters
+function update_hidden_params() {
+    const HNotch_params = get_HNotch_param_names()
+    const filter_version = get_filter_version()
+    const show_esc_mask = filter_version >= 4
+
+    for (let i = 0; i < HNotch_params.length; i++) {
+        // Show/hide ESCMSK based on filter version
+        const esc_mask_elem = document.getElementById(HNotch_params[i].esc_mask)
+        if (esc_mask_elem != null) {
+            esc_mask_elem.parentElement.style.display = show_esc_mask ? "" : "none"
+            if (!show_esc_mask) {
+                parameter_set_value(HNotch_params[i].esc_mask, 0)
+            }
+        }
+
+        // Set harmonic bitmask size based on firmware capability
+        set_bitmask_size(HNotch_params[i].harmonics, (have_INS_RAW_LOG_OPT || filter_version >= 3) ? 32 : 8)
+    }
+}
+
 // Update filter params extra info
 function filter_param_read() {
     const HNotch_params = get_HNotch_param_names()
@@ -2197,6 +1909,8 @@ function filter_param_read() {
             }
         }
     }
+
+    update_hidden_params()
 
     document.getElementById('calculate_filters').disabled = false
 
@@ -2214,51 +1928,18 @@ function time_range_changed() {
     document.getElementById('calculate_filters').disabled = false
 }
 
-var last_window_size
-function window_size_inc(event) {
-    if (last_window_size == null) {
-        last_window_size = parseFloat(event.target.defaultValue)
-    }
-    const new_value = parseFloat(event.target.value)
-    const change = parseFloat(event.target.value) - last_window_size
-    if (Math.abs(change) != 1) {
-        // Assume a change of one is comming from the up down buttons, ignore angthing else
-        last_window_size = new_value
-        return
-    }
-    var new_exponent = Math.log2(last_window_size)
-    if (!Number.isInteger(new_exponent)) {
-        // Move to power of two in the selected direction
-        new_exponent = Math.floor(new_exponent)
-        if (change > 0) {
-            new_exponent += 1
-        }
-
-    } else if (change > 0) {
-        // Move up one
-        new_exponent += 1
-
-    } else {
-        // Move down one
-        new_exponent -= 1
-
-    }
-    event.target.value = 2**new_exponent
-    last_window_size = event.target.value
-}
-
 // build url and query string for current params and open filter tool in new window
 function open_in_filter_tool() {
 
     // Assume same base
-    let url =  new URL(window.location.href);
+    let url =  new URL(window.location.href)
     url.pathname = url.pathname.replace('FilterReview','FilterTool')
 
     // Add all params
     function add_from_tags(url, items) {
         for (let item of items) {
             if (item.id.startsWith("INS_")) {
-                url.searchParams.append(item.name, item.value);
+                url.searchParams.append(item.name, item.value)
             }
         }
     }
@@ -2280,7 +1961,7 @@ function open_in_filter_tool() {
             continue
         }
         if (Gyro_batch[i].sensor_num == gyro_instance) {
-            url.searchParams.append("GYRO_SAMPLE_RATE", Math.round(Gyro_batch[i].gyro_rate));
+            url.searchParams.append("GYRO_SAMPLE_RATE", Math.round(Gyro_batch[i].gyro_rate))
             break
         }
     }
@@ -2288,41 +1969,41 @@ function open_in_filter_tool() {
     // Get values for tracking
     const mean_throttle = tracking_methods[1].get_mean()
     if (mean_throttle != undefined) {
-        url.searchParams.append("Throttle", mean_throttle);
+        url.searchParams.append("Throttle", mean_throttle)
     }
 
     const mean_rpm1 = tracking_methods[2].get_mean()
     if (mean_rpm1 != undefined) {
-        url.searchParams.append("RPM1", mean_rpm1);
+        url.searchParams.append("RPM1", mean_rpm1)
     }
 
     const mean_esc = tracking_methods[3].get_mean()
     if (mean_esc != undefined) {
-        url.searchParams.append("ESC_RPM", mean_esc);
-        url.searchParams.append("NUM_MOTORS", tracking_methods[3].get_num_motors());
+        url.searchParams.append("ESC_RPM", mean_esc)
+        url.searchParams.append("NUM_MOTORS", tracking_methods[3].get_num_motors())
     }
 
     // Filter tool does not support FFT tracking (4)
 
     const mean_rpm2 = tracking_methods[5].get_mean()
     if (mean_rpm2 != undefined) {
-        url.searchParams.append("RPM2", mean_rpm2);
+        url.searchParams.append("RPM2", mean_rpm2)
     }
 
 
-    window.open(url.toString());
+    window.open(url.toString())
 
 }
 
 function save_parameters() {
 
     function save_from_elements(inputs) {
-        var params = "";
+        var params = ""
         for (const v in inputs) {
-            var name = "" + inputs[v].id;
+            var name = "" + inputs[v].id
             if (name.startsWith("INS_")) {
-                var value = inputs[v].value;
-                params += name + "," + value + "\n";
+                var value = inputs[v].value
+                params += name + "," + param_to_string(value) + "\n"
             }
         }
         return params
@@ -2331,31 +2012,43 @@ function save_parameters() {
     var params = save_from_elements(document.getElementsByTagName("input"))
     params += save_from_elements(document.getElementsByTagName("select"))
 
-    var blob = new Blob([params], { type: "text/plain;charset=utf-8" });
-    saveAs(blob, "filter.param");
+    var blob = new Blob([params], { type: "text/plain;charset=utf-8" })
+    saveAs(blob, "filter.param")
 }
 
 async function load_parameters(file) {
-    var text = await file.text();
-    var lines = text.split('\n');
-    for (i in lines) {
-        var line = lines[i];
-        v = line.split(/[\s,=\t]+/);
+    var text = await file.text()
+    var lines = text.split('\n')
+    for (let i in lines) {
+        var line = lines[i]
+        let v = line.split(/[\s,=\t]+/)
         if (v.length >= 2) {
-            var vname = v[0];
-            var value = v[1];
+            var vname = v[0]
+            var value = v[1]
             if (parameter_set_value(vname, value)) {
-                console.log("set " + vname + "=" + value);
+                console.log("set " + vname + "=" + value)
             }
         }
     }
 
-    filter_param_read();
-    re_calc();
+    filter_param_read()
+    re_calc()
+}
+
+// Get selected filter version
+let have_INS_RAW_LOG_OPT = false
+const supported_filter_versions = [1, 2, 3, 4]
+function get_filter_version() {
+    for (const version of supported_filter_versions) {
+        const version_radio_button = document.getElementById("filter_version_" + version)
+        if (version_radio_button.checked) {
+            return version
+        }
+    }
 }
 
 // Load from batch logging messages
-function load_from_batch(log, num_gyro, gyro_rate) {
+function load_from_batch(log, num_gyro, gyro_rate, get_param) {
     Gyro_batch = []
     Gyro_batch.type = "batch"
 
@@ -2371,13 +2064,17 @@ function load_from_batch(log, num_gyro, gyro_rate) {
     const IMU_SENSOR_TYPE_GYRO = 1
     let data_index = 0
     let max_instance = 0
-    for (let i = 0; i < log.messages.ISBH.N.length; i++) {
+
+    const ISBH = log.get("ISBH")
+    const ISBD = log.get("ISBD")
+
+    for (let i = 0; i < ISBH.N.length; i++) {
         // Parse headers
-        if (log.messages.ISBH.type[i] != IMU_SENSOR_TYPE_GYRO) {
+        if (ISBH.type[i] != IMU_SENSOR_TYPE_GYRO) {
             continue
         }
 
-        const instance = log.messages.ISBH.instance[i]
+        const instance = ISBH.instance[i]
         if (Gyro_batch[instance] == null) {
             Gyro_batch[instance] = []
             max_instance = Math.max(max_instance, instance)
@@ -2386,12 +2083,12 @@ function load_from_batch(log, num_gyro, gyro_rate) {
         let decode_complete = false
 
         // Advance data index until sequence match
-        const seq_num = log.messages.ISBH.N[i]
-        while (log.messages.ISBD.N[data_index] != seq_num) {
+        const seq_num = ISBH.N[i]
+        while (ISBD.N[data_index] != seq_num) {
             data_index++
-            if (data_index >= log.messages.ISBD.N.length) {
+            if (data_index >= ISBD.N.length) {
                 // This is expected at the end of a log, no more msgs to add, break here
-                console.log("Could not find next sequence " + i + " of " + log.messages.ISBH.N.length-1)
+                console.log("Could not find next sequence " + i + " of " + ISBH.N.length-1)
                 decode_complete = true
                 break
             }
@@ -2403,23 +2100,23 @@ function load_from_batch(log, num_gyro, gyro_rate) {
         let x = []
         let y = []
         let z = []
-        const num_samples = log.messages.ISBH.smp_cnt[i]
+        const num_samples = ISBH.smp_cnt[i]
         const num_data_msg = num_samples / 32
         for (let j = 0; j < num_data_msg; j++) {
             // Read in expected number of samples
-            if ((log.messages.ISBD.N[data_index] != seq_num) || (log.messages.ISBD.seqno[data_index] != j)) {
+            if ((ISBD.N[data_index] != seq_num) || (ISBD.seqno[data_index] != j)) {
                 console.log("Missing or extra data msg")
                 return
             }
 
             // Accumulate data for this batch
-            x.push(...log.messages.ISBD.x[data_index])
-            y.push(...log.messages.ISBD.y[data_index])
-            z.push(...log.messages.ISBD.z[data_index])
+            x.push(...ISBD.x[data_index])
+            y.push(...ISBD.y[data_index])
+            z.push(...ISBD.z[data_index])
 
             data_index++
-            if (data_index >= log.messages.ISBD.N.length) {
-                console.log("Sequence incomplete " + i + " of " + (log.messages.ISBH.N.length-1) + ", Got " + (j+1) + " batches out of " + num_data_msg)
+            if (data_index >= ISBD.N.length) {
+                console.log("Sequence incomplete " + i + " of " + (ISBH.N.length-1) + ", Got " + (j+1) + " batches out of " + num_data_msg)
                 decode_complete = true
                 break
             }
@@ -2434,21 +2131,28 @@ function load_from_batch(log, num_gyro, gyro_rate) {
         }
 
         // Remove logging scale factor
-        const mul = 1/log.messages.ISBH.mul[i]
+        const mul = 1 / ISBH.mul[i]
         x = array_scale(x, mul)
         y = array_scale(y, mul)
         z = array_scale(z, mul)
 
         // Add to batches for this instance
-        Gyro_batch[instance].push({ sample_time: log.messages.ISBH.SampleUS[i] / 1000000,
-                                    sample_rate: log.messages.ISBH.smp_rate[i],
+        Gyro_batch[instance].push({ sample_time: ISBH.SampleUS[i] * US2S,
+                                    sample_rate: ISBH.smp_rate[i],
                                     x: x,
                                     y: y,
                                     z: z })
     }
 
+    // Remove any batches with no data
+    for (let i = 0; i < Gyro_batch.length; i++) {
+        if (Gyro_batch[i]?.length === 0) {
+            Gyro_batch[i] = null
+        }
+    }
+
     // Work out if logging is pre/post from param value
-    const INS_LOG_BAT_OPT = get_param_value(log.messages.PARM, "INS_LOG_BAT_OPT", false)
+    const INS_LOG_BAT_OPT = get_param("INS_LOG_BAT_OPT", false)
     const _doing_sensor_rate_logging = (INS_LOG_BAT_OPT & (1 << 0)) != 0
     const _doing_post_filter_logging = (INS_LOG_BAT_OPT & (1 << 1)) != 0
     const _doing_pre_post_filter_logging = (INS_LOG_BAT_OPT & (1 << 2)) != 0
@@ -2469,6 +2173,11 @@ function load_from_batch(log, num_gyro, gyro_rate) {
         } else {
             Gyro_batch[i].sensor_num = i
             Gyro_batch[i].post_filter = _doing_post_filter_logging && !_doing_pre_post_filter_logging
+        }
+
+        // Only support 3 IMUs for now
+        if (Gyro_batch[i].sensor_num >= 3) {
+            Gyro_batch[i] = null
         }
     }
 
@@ -2520,7 +2229,7 @@ function load_from_batch(log, num_gyro, gyro_rate) {
 }
 
 // Log from raw sensor logging
-function load_from_raw_log(log, num_gyro, gyro_rate) {
+function load_from_raw_log(log, num_gyro, gyro_rate, get_param) {
     Gyro_batch = []
     Gyro_batch.type = "raw"
 
@@ -2531,31 +2240,38 @@ function load_from_raw_log(log, num_gyro, gyro_rate) {
     Gyro_batch.quantization_noise = 0.0
 
     // Work out if logging is pre/post from param value
-    const INS_RAW_LOG_OPT = get_param_value(log.messages.PARM, "INS_RAW_LOG_OPT", false)
-    const post_filter = (INS_RAW_LOG_OPT != null) && ((INS_RAW_LOG_OPT & (1 << 2)) != 0)
+    const INS_RAW_LOG_OPT = get_param("INS_RAW_LOG_OPT", false)
+    let post_filter = (INS_RAW_LOG_OPT != null) && ((INS_RAW_LOG_OPT & (1 << 2)) != 0)
     const pre_post_filter = (INS_RAW_LOG_OPT != null) && ((INS_RAW_LOG_OPT & (1 << 3)) != 0)
     if (post_filter && pre_post_filter) {
-        allert("Both post and pre+post logging option selected")
+        alert("Both post and pre+post logging option selected")
         post_filter = false
     }
 
     // Load in a one massive batch, split for large gaps in log
-    for (let i = 0; i < 6; i++) {
-        var instance_name = "GYR[" + i + "]"
-        if (log.messages[instance_name] == null) {
-            // Try single gyro instance
-            if (!("I" in log.messages.GYR) || !Array.from(log.messages.GYR.I).every((x) => x == i)) {
-                continue
-            }
-            instance_name = "GYR"
-        }
-        if (log.messages[instance_name].length == 0) {
-            continue
-        }
+    for (const inst of Object.keys(log.messageTypes.GYR.instances)) {
+        const i = parseFloat(inst)
 
         Gyro_batch[i] = []
 
-        const time = Array.from(log.messages[instance_name].SampleUS)
+        if (pre_post_filter && (i >= num_gyro)) {
+            Gyro_batch[i].sensor_num = i - num_gyro
+            Gyro_batch[i].post_filter = true
+        } else {
+            Gyro_batch[i].sensor_num = i
+            Gyro_batch[i].post_filter = post_filter
+        }
+
+        // Only support 3 IMUs for now
+        if (Gyro_batch[i].sensor_num >= 3) {
+            Gyro_batch[i] = null
+            continue
+        }
+
+        const time = log.get_instance("GYR", inst, "SampleUS")
+        const GyrX = log.get_instance("GYR", inst, "GyrX")
+        const GyrY = log.get_instance("GYR", inst, "GyrY")
+        const GyrZ = log.get_instance("GYR", inst, "GyrZ")
 
         let sample_rate_sum = 0
         let sample_rate_count = 0
@@ -2574,11 +2290,11 @@ function load_from_raw_log(log, num_gyro, gyro_rate) {
                     sample_rate_sum += sample_rate
                     sample_rate_count++
 
-                    Gyro_batch[i].push({ sample_time: log.messages[instance_name].SampleUS[batch_start] / 1000000,
+                    Gyro_batch[i].push({ sample_time: time[batch_start] * US2S,
                                         sample_rate: sample_rate,
-                                        x: Array.from(log.messages[instance_name].GyrX.slice(batch_start, j-i)),
-                                        y: Array.from(log.messages[instance_name].GyrY.slice(batch_start, j-i)),
-                                        z: Array.from(log.messages[instance_name].GyrZ.slice(batch_start, j-i)) })
+                                        x: GyrX.slice(batch_start, j-i),
+                                        y: GyrY.slice(batch_start, j-i),
+                                        z: GyrZ.slice(batch_start, j-i) })
                 }
 
                 // Start the next batch from this point
@@ -2588,20 +2304,18 @@ function load_from_raw_log(log, num_gyro, gyro_rate) {
 
         }
 
+        if (Gyro_batch[i].length == 0) {
+            // No valid batches, remove
+            delete Gyro_batch[i]
+            continue
+        }
+
         // Assume a constant sample rate for the FFT
         const sample_rate = sample_rate_sum / sample_rate_count
         Gyro_batch[i].gyro_rate = sample_rate
         if (gyro_rate[i] != null) {
             // Make sure rate is at least the reported sampling rate
             Gyro_batch[i].gyro_rate = Math.max(gyro_rate[i], Gyro_batch[i].gyro_rate)
-        }
-
-        if (pre_post_filter && (i >= num_gyro)) {
-            Gyro_batch[i].sensor_num = i - num_gyro
-            Gyro_batch[i].post_filter = true
-        } else {
-            Gyro_batch[i].sensor_num = i
-            Gyro_batch[i].post_filter = post_filter
         }
 
     }
@@ -2631,8 +2345,13 @@ function load_from_raw_log(log, num_gyro, gyro_rate) {
 
 var Gyro_batch
 var tracking_methods
+var logged_tracking
 var filters
-function load(log_file) {
+async function load(log_file) {
+
+    // Make sure imports are fully loaded before starting
+    // This is needed when called from "open in"
+    await import_done
 
     const start = performance.now()
 
@@ -2640,11 +2359,17 @@ function load(log_file) {
     reset()
 
     let log = new DataflashParser()
-    log.processData(log_file, ['PARM', 'IMU'])
+    log.processData(log_file, [])
 
-    if ((Object.keys(log.messages.PARM).length == 0) && (Object.keys(log.messages.IMU).length == 0)) {
-        alert("No params or IMU in log")
+    open_in_update(log)
+
+    if (!("PARM" in log.messageTypes)) {
+        alert("No params in log")
         return
+    }
+    const PARM = log.get("PARM")
+    function get_param(name, allow_change) {
+        return get_param_value(PARM, name, allow_change)
     }
 
     // Try and decode device IDs and rate
@@ -2652,27 +2377,13 @@ function load(log_file) {
     var gyro_rate = []
     for (let i = 0; i < 3; i++) {
         const ID_param = i == 0 ? "INS_GYR_ID" : "INS_GYR" + (i + 1) + "_ID"
-        const ID = get_param_value(log.messages.PARM, ID_param)
+        const ID = get_param(ID_param)
         if ((ID != null) && (ID > 0)) {
             const decoded = decode_devid(ID, DEVICE_TYPE_IMU)
 
-            if (log.messages.IMU != null) {
-                let msg_key
-                const instance_key = "IMU[" + i + "]"
-                if (log.messages[instance_key] != null) {
-                    // Multiple IMU instances
-                    msg_key = instance_key
-
-                } else if (("I" in log.messages.IMU) && Array.from(log.messages.IMU.I).every((x) => x == i)) {
-                    // Single instance
-                    msg_key = "IMU"
-
-                }
-                if (msg_key != null) {
-                    // Assume constant rate, this is not actually true, but variable rate breaks FFT averaging.
-                    gyro_rate[i] = array_mean(Array.from(log.messages[msg_key].GHz))
-                }
-
+            if (("IMU" in log.messageTypes) && ("instances" in log.messageTypes.IMU) && (i in log.messageTypes.IMU.instances)) {
+                // Assume constant rate, this is not actually true, but variable rate breaks FFT averaging.
+                gyro_rate[i] = array_mean(log.get_instance("IMU", i, "GHz"))
             }
 
             if (decoded != null) {
@@ -2684,11 +2395,8 @@ function load(log_file) {
     }
 
     // Check for some data that we can use
-    log.parseAtOffset("ISBH")
-    log.parseAtOffset("ISBD")
-    log.parseAtOffset("GYR")
-    const have_batch_log = (Object.keys(log.messages.ISBH).length > 0) && (Object.keys(log.messages.ISBD).length > 0)
-    const have_raw_log = Object.keys(log.messages.GYR).length > 0
+    const have_batch_log = ("ISBH" in log.messageTypes) && ("ISBD" in log.messageTypes)
+    const have_raw_log = ("GYR" in log.messageTypes)
 
     if (!have_batch_log && !have_raw_log) {
         alert("No batch data or raw IMU found in log")
@@ -2700,35 +2408,57 @@ function load(log_file) {
     if (have_batch_log && !have_raw_log) {
         // Only have batch log
         document.getElementById("log_type_batch").checked = true
-        document.getElementById("log_type_raw").disabled = true
         use_batch = true
 
     } else if (have_raw_log && !have_batch_log) {
         // Only have raw log
         document.getElementById("log_type_raw").checked = true
-        document.getElementById("log_type_batch").disabled = true
         use_batch = false
 
     } else {
         // Have both, use selected
         use_batch = document.getElementById("log_type_batch").checked
     }
+
+    // Cannot change log type after the log has been loaded, disable both buttons
+    document.getElementById("log_type_batch").disabled = true
+    document.getElementById("log_type_raw").disabled = true
+
     document.getElementById("FFTWindow_size").disabled = use_batch
     document.getElementById("FFTWindow_per_batch").disabled = !use_batch
 
 
     if (use_batch) {
-        load_from_batch(log, num_gyro, gyro_rate)
+        load_from_batch(log, num_gyro, gyro_rate, get_param)
 
     } else {
-        load_from_raw_log(log, num_gyro, gyro_rate)
+        load_from_raw_log(log, num_gyro, gyro_rate, get_param)
 
     }
 
-    // Delete log data now it has been used
-    delete log.messages.ISBH
-    delete log.messages.ISBD
-    delete log.messages.GYR
+    // May have log messages but nothing in them
+    if (Gyro_batch.start_time == undefined || Gyro_batch.end_time == undefined) {
+        alert("No valid gyro data found in log")
+        return
+    }
+
+    // Populate filter version
+    if (('VER' in log.messageTypes) && log.messageTypes.VER.expressions.includes("FV")) {
+        // Version should be constant for whole log
+        const version = log.get("VER", "FV")[0]
+        const version_radio_button = document.getElementById("filter_version_" + version)
+        if (version_radio_button != null) {
+            version_radio_button.checked = true
+        } else {
+            alert("Unsupported filter version: " + version)
+
+            // Default to the latest version in this case
+            document.getElementById("filter_version_" + supported_filter_versions.at(-1)).checked = true
+        }
+    }
+    for (const version of supported_filter_versions) {
+        document.getElementById("filter_version_" + version).disabled = false
+    }
 
     // Load potential sources of notch tracking targets
     tracking_methods = [new StaticTarget(),
@@ -2738,19 +2468,27 @@ function load(log_file) {
                         new FFTTarget(log),
                         new RPMTarget(log, 2, 5)]
 
+    // Load logged notch fequencies for comparison
+    logged_tracking = [ new LoggedNotch(log, 0),
+                        new LoggedNotch(log, 1) ]
+
+    // If log data is present allow user to show it
+    let show_logged_notch = false
+    for (let i = 0; i < logged_tracking.length; i++) {
+        if (logged_tracking[i].have_data()) {
+            show_logged_notch = true
+        }
+    }
+    document.getElementById("SpecNotchShowLogged").disabled = !show_logged_notch
+
     // Use presence of raw log options param to work out if 8 or 16 harmonics are avalable
-    const have_16_harmonics = get_param_value(log.messages.PARM, "INS_RAW_LOG_OPT") != null
+    have_INS_RAW_LOG_OPT = get_param("INS_RAW_LOG_OPT") != null
 
     // Read from log into HTML box
     const HNotch_params = get_HNotch_param_names()
     for (let i = 0; i < HNotch_params.length; i++) {
         for (const param of Object.values(HNotch_params[i])) {
-            // Set harmonic bitmask size
-            if (param.endsWith("HMNCS")) {
-                // Although only 16 harmonic are supported the underlying param type was changed to 32bit
-                set_bitmask_size(param, have_16_harmonics ? 32 : 8)
-            }
-            const value = get_param_value(log.messages.PARM, param)
+            const value = get_param(param)
             if (value != null) {
                 parameter_set_value(param, value)
             }
@@ -2759,42 +2497,57 @@ function load(log_file) {
 
     const other_params = ["INS_GYRO_FILTER", "SCHED_LOOP_RATE"]
     for (const param of other_params) {
-        const value = get_param_value(log.messages.PARM, param)
+        const value = get_param(param)
         if (value != null) {
             parameter_set_value(param, value)
         }
     }
 
     // Plot flight data from log
-    log.parseAtOffset("ATT")
-
-    if (Object.keys(log.messages.ATT).length > 0) {
-        const ATT_time = array_scale(Array.from(log.messages.ATT.time_boot_ms), 1 / 1000)
+    if ("ATT" in log.messageTypes) {
+        const ATT_time = TimeUS_to_seconds(log.get("ATT", "TimeUS"))
         flight_data.data[0].x = ATT_time
-        flight_data.data[0].y = Array.from(log.messages.ATT.Roll)
+        flight_data.data[0].y = log.get("ATT", "Roll")
 
         flight_data.data[1].x = ATT_time
-        flight_data.data[1].y = Array.from(log.messages.ATT.Pitch)
+        flight_data.data[1].y = log.get("ATT", "Pitch")
     }
 
-    if (Object.keys(log.messages.RATE).length > 0) {
-        flight_data.data[2].x = array_scale(Array.from(log.messages.RATE.time_boot_ms), 1 / 1000)
-        flight_data.data[2].y = Array.from(log.messages.RATE.AOut)
+    let first_throttle_time
+    let last_throttle_time
+    if ("RATE" in log.messageTypes) {
+        // Get values
+        const RATE_time = TimeUS_to_seconds(log.get("RATE", "TimeUS"))
+        const throttle = log.get("RATE", "AOut")
+
+        // Plot
+        flight_data.data[2].x = RATE_time
+        flight_data.data[2].y = throttle
+
+        // Find first and last throttle for auto-zoom of plot
+        function positive_throttle(x) {
+            return x > 0.0
+        }
+        const first_index = throttle.findIndex(positive_throttle)
+        const last_index = throttle.findLastIndex(positive_throttle)
+        if (first_index) {
+            first_throttle_time = RATE_time[first_index]
+        }
+        if (last_index) {
+            last_throttle_time = RATE_time[last_index]
+        }
     }
 
-    log.parseAtOffset("POS")
-    if (Object.keys(log.messages.POS).length > 0) {
-        flight_data.data[3].x = array_scale(Array.from(log.messages.POS.time_boot_ms), 1 / 1000)
-        flight_data.data[3].y = Array.from(log.messages.POS.RelHomeAlt)
+    if ("POS" in log.messageTypes) {
+        flight_data.data[3].x = TimeUS_to_seconds(log.get("POS", "TimeUS"))
+        flight_data.data[3].y = log.get("POS", "RelHomeAlt")
     }
-
-    Plotly.redraw("FlightData")
 
     // Try and work out which is the primary sensor
     let primary_gyro = 0
-    const AHRS_EKF_TYPE = get_param_value(log.messages.PARM, "AHRS_EKF_TYPE")
-    const EK3_PRIMARY = get_param_value(log.messages.PARM, "EK3_PRIMARY")
-    if ((AHRS_EKF_TYPE == 3) && (EK3_PRIMARY != null)) {
+    const AHRS_EKF_TYPE = get_param("AHRS_EKF_TYPE")
+    const EK3_PRIMARY = get_param("EK3_PRIMARY")
+    if ((AHRS_EKF_TYPE == 3) && (EK3_PRIMARY != null) && (EK3_PRIMARY >= 0) && (EK3_PRIMARY <= 2)) {
         primary_gyro = EK3_PRIMARY
 
         // Add label to primary
@@ -2818,13 +2571,6 @@ function load(log_file) {
         primary_gyro = null
     }
 
-    // Were now done with the log, delete it to save memory before starting caculations
-    delete log.buffer
-    delete log.data
-    delete log.messages
-    log_file = null
-    log = null
-
     // Enable top level filter params
     parameter_set_disable("INS_GYRO_FILTER", false)
     parameter_set_disable("SCHED_LOOP_RATE", false)
@@ -2835,21 +2581,40 @@ function load(log_file) {
     filter_param_read()
     load_filters()
 
+    // Use orginal harmonics value for logged notches
+    for (let i = 0; i < filters.notch.length; i++) {
+        logged_tracking[i].harmonics = filters.notch[i].harmonics()
+    }
+
     // Update ranges of start and end time
-    start_time = Math.floor(Gyro_batch.start_time)
-    end_time = Math.ceil(Gyro_batch.end_time)
+    let data_start_time = Math.floor(Gyro_batch.start_time)
+    let data_end_time = Math.ceil(Gyro_batch.end_time)
+
+    // If found use zoom to none zero throttle
+    let calc_start_time = data_start_time
+    let calc_end_time = data_end_time
+    if ((first_throttle_time != null) && (last_throttle_time != null)) {
+        // Round throttle points to center and add 1 second. This trys to crop out the throttle rising from 0 and dropping back to 0
+        calc_start_time = Math.max(calc_start_time, Math.ceil(first_throttle_time) + 1.0)
+        calc_end_time = Math.min(calc_end_time, Math.floor(last_throttle_time) - 1.0)
+
+        flight_data.layout.xaxis.range = [calc_start_time, calc_end_time]
+        flight_data.layout.xaxis.autorange = false
+    }
+
+    Plotly.redraw("FlightData")
 
     var start_input = document.getElementById("TimeStart")
-    start_input.disabled = false;
-    start_input.min = start_time
-    start_input.value = start_time
-    start_input.max = end_time
+    start_input.disabled = false
+    start_input.min = data_start_time
+    start_input.value = calc_start_time
+    start_input.max = data_end_time
 
     var end_input = document.getElementById("TimeEnd")
-    end_input.disabled = false;
-    end_input.min = start_time
-    end_input.value = end_time
-    end_input.max = end_time
+    end_input.disabled = false
+    end_input.min = data_start_time
+    end_input.value = calc_end_time
+    end_input.max = data_end_time
 
     // Enable checkboxes for sensors which are present
     var first_gyro
@@ -2935,6 +2700,6 @@ function load(log_file) {
     document.getElementById("SaveParams").disabled = false
     document.getElementById("LoadParams").disabled = false
 
-    const end = performance.now();
-    console.log(`Load took: ${end - start} ms`);
+    const end = performance.now()
+    console.log(`Load took: ${end - start} ms`)
 }
